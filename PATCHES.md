@@ -39,6 +39,26 @@ Keep these when updating, otherwise the proxy will fail with
    fallback). `/health` called it synchronously on every poll; the result is now
    cached for 15s and resolved in a worker thread.
 
+8. **Quota-aware egress blocklist (`ip_blocklist.py`)**
+   WARP re-assigns IPs whose daily free-tier quota is already spent, so a
+   "successful" rotation can land on a dead address and every request keeps
+   returning `429` (typically with a multi-hour `Retry-After`).
+
+   - `blocked_egress_ips` in the shared `metrics.db` records each exhausted IP
+     until the upstream reset time (`Retry-After`), or 24h when absent.
+   - The proxy checks the 429 class: a quota error or
+     `Retry-After >= IP_EXHAUSTION_RETRY_AFTER` (default 300s) marks the current
+     egress IP, rotates, and retries the request on the fresh IP. Short
+     transient limits are still returned as-is.
+   - `rotator.py` refuses to accept a blocklisted IP during rotation (tries
+     another registration) and rotates away from a blocklisted address at
+     startup.
+   - `/metrics` and the dashboard expose the active blocklist.
+
+9. **Model names prefixed with `WARP · `**
+   `sync-models.sh` now labels proxied models so they can be told apart from the
+   identical built-in `opencode` provider entries in `/models`.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.

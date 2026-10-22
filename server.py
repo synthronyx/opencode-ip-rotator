@@ -23,7 +23,8 @@ from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from curl_cffi import requests as cffi_requests
-from rate_limits import classify_upstream_429
+import ip_blocklist
+from rate_limits import classify_upstream_429, is_quota_exhausted
 from rotator import flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
 
 # -----------------------------------------------------------------------------
@@ -202,6 +203,7 @@ def init_db():
             expires_at REAL NOT NULL
         )
     """)
+    ip_blocklist.init_db()
 
 
 def acquire_flow_lease() -> str:
@@ -458,6 +460,11 @@ TARGET_ZEN_ANTHROPIC_URL = f"{TARGET_ZEN_BASE}/messages"
 TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "8"))
+# How many exhausted IPs a single request may burn (and rotate away from) before
+# we hand the upstream 429 back to the client.
+MAX_EGRESS_ROTATIONS_PER_REQUEST = int(os.environ.get("MAX_EGRESS_ROTATIONS_PER_REQUEST", "3"))
+# Serialise exhaustion handling so two concurrent 429s do not rotate twice.
+_egress_rotation_lock = asyncio.Lock()
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 CORS_ALLOW_ORIGINS = [
@@ -648,10 +655,93 @@ def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
 
+async def rotate_away_from_exhausted_ip(
+    model_name: str, category: str, retry_seconds: Optional[int]
+) -> bool:
+    """Handle a 429 that means "this egress IP's daily budget is gone".
+
+    The IP is added to the persistent blocklist (shared with the rotator) and a
+    fresh egress IP is requested.  Returns True when the caller should retry the
+    upstream request on the new IP.
+    """
+    exhausted = is_quota_exhausted(
+        category, retry_seconds, ip_blocklist.EXHAUSTION_RETRY_AFTER_SECONDS
+    )
+    if not exhausted:
+        return False
+
+    egress_ip = await asyncio.to_thread(get_public_ip)
+    if not egress_ip:
+        log.warning(
+            "Quota exhausted for '%s', but the current egress IP could not be identified.",
+            model_name,
+        )
+        return False
+
+    expiry = await asyncio.to_thread(
+        ip_blocklist.block_ip,
+        egress_ip,
+        (time.time() + retry_seconds) if retry_seconds else None,
+        f"upstream {category} for {model_name}",
+    )
+    log.warning(
+        "Egress IP %s has no upstream quota left (%s, retry_after=%ss); blocked until %s.",
+        egress_ip,
+        category,
+        retry_seconds,
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry))
+        if expiry
+        else "unknown",
+    )
+
+    async with _egress_rotation_lock:
+        # Another request may have rotated while we waited for the lock.  If so,
+        # retry on that fresh IP instead of burning another one.
+        active_ip = await asyncio.to_thread(get_public_ip)
+        if active_ip and active_ip != egress_ip and not ip_blocklist.is_blocked(active_ip):
+            log.info(
+                "Egress already rotated %s -> %s by another request; retrying on it.",
+                egress_ip,
+                active_ip,
+            )
+            return True
+
+        rotated, new_ip = await asyncio.to_thread(
+            rotate_egress, f"exhausted egress IP {egress_ip}"
+        )
+        if not rotated:
+            log.warning(
+                "Egress rotation failed; %s is still the active IP and stays blocked.",
+                egress_ip,
+            )
+            return False
+
+        if not new_ip:
+            log.warning("Rotation reported success but returned no verified IP; not retrying blindly.")
+            return False
+
+        if ip_blocklist.is_blocked(new_ip):
+            log.warning(
+                "Rotated onto %s, which is also blocklisted; refusing to reuse it.",
+                new_ip,
+            )
+            return False
+
+        log.info(
+            "Egress rotated %s -> %s; retrying '%s' on the fresh IP.",
+            egress_ip,
+            new_ip,
+            model_name,
+        )
+        return True
+
+
 def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
     """Request rotation from the service that owns the shared WARP namespace."""
     try:
-        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+        # A fresh registration can need several WARP attempts; give it enough
+        # headroom that the client is not told "rotation failed" mid-cycle.
+        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=90)
         data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         if response.status_code == 200 and data.get("status") == "success":
             return True, data.get("verified_ip")
@@ -877,7 +967,8 @@ async def get_metrics():
         "ip_history": rotator_history,
         "warp_quality": dict(warp_quality_stats),
         "dual_warp": dict(_dual_warp),
-        "rotation_in_progress": _rotation_in_progress.is_set()
+        "rotation_in_progress": _rotation_in_progress.is_set(),
+        "blocked_egress_ips": ip_blocklist.list_blocked()
     }
 
 @app.get("/health")
@@ -897,6 +988,7 @@ async def health():
         "active_flows": active_flows_count,
         "total_rotations": rotation_count,
         "warp_quality": dict(warp_quality_stats),
+        "blocked_egress_ips": len(ip_blocklist.list_blocked()),
     }
 
 @app.get("/v1/models")
@@ -937,6 +1029,7 @@ async def chat_completions(raw_request: Request):
         if kl.startswith("x-opencode-") or kl == "user-agent":
             headers[k] = v
 
+    rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -957,6 +1050,15 @@ async def chat_completions(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
+                category, retry_seconds, _ = classify_upstream_429(response)
+                if (
+                    rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
+                    and await rotate_away_from_exhausted_ip(
+                        current_model, category, retry_seconds
+                    )
+                ):
+                    rotations_done += 1
+                    continue
                 return upstream_rate_limit_response(response, current_model)
 
             if response.status_code >= 500:
@@ -1054,6 +1156,7 @@ async def anthropic_messages(raw_request: Request):
         if kl.startswith("x-opencode-") or kl.startswith("anthropic-") or kl == "user-agent":
             headers[k] = v
 
+    rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -1074,6 +1177,15 @@ async def anthropic_messages(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                category, retry_seconds, _ = classify_upstream_429(response)
+                if (
+                    rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
+                    and await rotate_away_from_exhausted_ip(
+                        model_name, category, retry_seconds
+                    )
+                ):
+                    rotations_done += 1
+                    continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
@@ -1141,6 +1253,7 @@ async def responses_endpoint(raw_request: Request):
         if k.lower().startswith("x-opencode-") or k.lower() == "user-agent":
             headers[k] = v
 
+    rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -1161,6 +1274,15 @@ async def responses_endpoint(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                category, retry_seconds, _ = classify_upstream_429(response)
+                if (
+                    rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
+                    and await rotate_away_from_exhausted_ip(
+                        model_name, category, retry_seconds
+                    )
+                ):
+                    rotations_done += 1
+                    continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:

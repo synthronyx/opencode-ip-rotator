@@ -203,6 +203,9 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `WARP_CHECK_INTERVAL` | `15` | WARP health check interval |
 | `OPENCODE_ZEN_PORT` | `8000` | Proxy port |
 | `UPSTREAM_STREAM_TIMEOUT` | `150` | Seconds without upstream bytes before the proxy aborts and retries |
+| `IP_EXHAUSTION_RETRY_AFTER` | `300` | A 429 `Retry-After` at/above this many seconds means the IP's daily quota is gone |
+| `IP_EXHAUSTION_BLOCK_SECONDS` | `86400` | Fallback block duration when upstream sends no reset time |
+| `MAX_EGRESS_ROTATIONS_PER_REQUEST` | `3` | Exhausted IPs one request may rotate away from before returning 429 |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
@@ -239,7 +242,7 @@ docker compose logs --tail 20 proxy-server | grep -E 'Received request|status=20
 
 ## Fixes in this fork
 
-All changes are in `server.py`; details in [PATCHES.md](PATCHES.md).
+Details in [PATCHES.md](PATCHES.md).
 
 1. **Upstream `Accept-Encoding`** — the free-tier endpoint rejects requests that
    do not advertise compression. The proxy now sends
@@ -250,11 +253,59 @@ All changes are in `server.py`; details in [PATCHES.md](PATCHES.md).
    separators. Without this, reasoning models (e.g. DeepSeek) fail with
    `Invalid openai-compatible-chat stream event`.
 4. **Single `[DONE]`** — no duplicate terminator when upstream already sent one.
-5. **`sync-models.sh`** — keeps the V2 explicit model list in sync with the
-   models discovered by the proxy.
+5. **Non-blocking upstream calls** — `curl_cffi` calls run in worker threads, so
+   one slow request no longer freezes `/health`, the dashboard, or other chats.
+6. **Fast-fail stalled upstreams** — `UPSTREAM_STREAM_TIMEOUT` (default 150s)
+   replaces libcurl's 600s low-speed timeout, so retries happen before the
+   OpenCode client gives up.
+7. **Cached public IP** — `/health` no longer performs an external IP lookup on
+   every poll.
+8. **Quota-aware egress blocklist** — an IP whose daily quota is exhausted is
+   recorded in `blocked_egress_ips` (until the upstream reset time) and never
+   reused by the rotator; the proxy rotates away and retries on a fresh IP.
+9. **`sync-models.sh`** — keeps the V2 explicit model list in sync with the
+   models discovered by the proxy (prefixed `WARP · `).
 
-Files changed vs upstream: `server.py` (4 fixes), plus new `sync-models.sh`,
-`PATCHES.md`, and this README.
+Files changed vs upstream: `server.py`, `rotator.py`, `rate_limits.py`,
+`ip_blocklist.py` (new), `sync-models.sh` (new), `tests/` (new), plus
+`PATCHES.md` and this README.
+
+---
+
+## Quota-aware IP blocking
+
+WARP hands out a small pool of addresses and will re-assign an IP whose daily
+free-tier quota is already spent. Rotating onto such an IP "succeeds" (the
+address changed) but every request still returns `429` with a multi-hour
+`Retry-After`.
+
+This fork keeps those addresses in a shared SQLite table
+(`blocked_egress_ips` in `data/metrics.db`) until the upstream reset time:
+
+- the proxy detects the exhausted IP from the 429 (quota error, or
+  `Retry-After >= IP_EXHAUSTION_RETRY_AFTER`), records it, rotates, and retries
+  the request on the fresh IP;
+- the rotator refuses to accept any IP from the blocklist during rotation and at
+  startup, trying another registration instead;
+- transient limits (short `Retry-After`, e.g. 30–60s) are **not** blocked.
+
+Inspect the blocklist:
+
+```bash
+curl -s http://127.0.0.1:8000/metrics |
+  python3 -c "import json,sys; [print(e['ip'], 'until', e['blocked_until_iso'], '-', e['reason']) for e in json.load(sys.stdin)['blocked_egress_ips']]"
+```
+
+It is also shown as **Blocked Egress IPs** on the dashboard. Entries expire
+automatically; to clear one early:
+
+```bash
+docker exec opencode_proxy_server python3 -c "
+import ip_blocklist
+with ip_blocklist._connect() as c:
+    c.execute('DELETE FROM blocked_egress_ips WHERE ip = ?', ('104.28.x.x',))
+"
+```
 
 ---
 
@@ -267,6 +318,8 @@ Files changed vs upstream: `server.py` (4 fixes), plus new `sync-models.sh`,
 | `Invalid ... stream event` | SSE separator bug — apply fix 3 (blank lines while buffering). |
 | `Retry due · attempt N · Timed out waiting for response headers` | OpenCode gives up after ~5 min per attempt. A WARP path stalled and the proxy waited too long before retrying. Fixed by fixes 5 and 6; tune `UPSTREAM_STREAM_TIMEOUT` if you still see it. |
 | Dashboard/`/health` slow or unresponsive while chatting | Blocking upstream calls froze the event loop. Fixed by fix 5 — check you are running this fork, not upstream. |
+| `429` with a multi-hour `Retry-After` | That egress IP burned its daily quota. The proxy should block it and rotate automatically. If the 429 still reaches you, rotation could not run (e.g. streams active); check **Blocked Egress IPs** on the dashboard or `/metrics`, then retry. |
+| Dashboard shows blocked IPs but chats still 429 | All rotation attempts landed on exhausted addresses. Wait for the reset shown in *Blocked Until*, or add residential proxies via `PROXY_LIST`. |
 | Dashboard up, `/v1/models` empty | Upstream discovery failed or WARP not connected: `docker compose logs warp-rotator`. |
 | Container exits: cannot create `/dev/net/tun` | Enable the tun module on the host: `sudo modprobe tun`, then `docker compose up -d`. |
 | `bind: address already in use` on 8000 | Something else uses port 8000. Change the `8000:8000` mapping in `docker-compose.yml` and the provider `baseURL`. |

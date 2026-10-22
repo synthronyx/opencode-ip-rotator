@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import ip_blocklist
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -254,7 +256,11 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                             time.sleep(3)
                             new_ip = get_public_ip()
 
-                            if new_ip and new_ip != old_ip:
+                            if (
+                                new_ip
+                                and new_ip != old_ip
+                                and not ip_blocklist.is_blocked(new_ip)
+                            ):
                                 _current_ip = new_ip
                                 rotation_count += 1
                                 loc = get_ip_location(new_ip)
@@ -291,6 +297,16 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                                     trigger_container_recycle()
 
                                 return True
+                            elif new_ip and new_ip != old_ip:
+                                blocked_until = ip_blocklist.blocked_until(new_ip)
+                                log.warning(
+                                    "Attempt %s: Assigned IP %s is blocklisted (quota exhausted until %s). Rotating again...",
+                                    attempt,
+                                    new_ip,
+                                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until))
+                                    if blocked_until
+                                    else "unknown",
+                                )
                             else:
                                 log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
                     except FileNotFoundError:
@@ -311,7 +327,14 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                         if resp.status == 200:
                             res_data = json.loads(resp.read().decode("utf-8"))
                             if res_data.get("status") == "success":
-                                _current_ip = res_data.get("verified_ip", _current_ip)
+                                candidate_ip = res_data.get("verified_ip", _current_ip)
+                                if candidate_ip and ip_blocklist.is_blocked(candidate_ip):
+                                    log.warning(
+                                        "Remote rotator assigned blocklisted IP %s; trying another method.",
+                                        candidate_ip,
+                                    )
+                                    continue
+                                _current_ip = candidate_ip
                                 log.info(f"Rotation via remote rotator service ({endpoint}) successful. Verified IP: {_current_ip}")
                                 return True
                 except Exception:
@@ -322,7 +345,7 @@ def rotate_warp(reason: str = "Triggered") -> bool:
             proxy = get_next_proxy()
             if proxy:
                 new_ip = get_public_ip_via_proxy(proxy)
-                if new_ip and new_ip != old_ip:
+                if new_ip and new_ip != old_ip and not ip_blocklist.is_blocked(new_ip):
                     _current_ip = new_ip
                     rotation_count += 1
                     loc = get_ip_location(new_ip)
@@ -341,7 +364,7 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                     log.info(f"Proxy IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
                     return True
                 else:
-                    log.warning("Proxy rotation failed to provide a different IP.")
+                    log.warning("Proxy rotation failed to provide a different, non-blocklisted IP.")
             else:
                 log.warning("No proxies available for rotation.")
 
@@ -441,9 +464,19 @@ def _cleanup_warp():
 def main() -> None:
     elevate()
     load_proxy_list()
+    ip_blocklist.init_db()
     global _current_ip
     _current_ip = get_public_ip()
     log.info(f"Starting IP Rotator Node... Initial Verified Public IP: {_current_ip}")
+
+    blocked_until = ip_blocklist.blocked_until(_current_ip)
+    if _current_ip and blocked_until:
+        log.warning(
+            "Startup egress IP %s already burned its upstream quota (blocked until %s); rotating away.",
+            _current_ip,
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until)),
+        )
+        rotate_warp("startup IP is blocklisted")
 
     stop_event = threading.Event()
 

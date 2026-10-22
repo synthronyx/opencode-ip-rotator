@@ -20,3 +20,17 @@ def classify_upstream_429(response) -> tuple[str, int | None, object]:
     else:
         category = "upstream_rate_limit"
     return category, retry_seconds, payload
+
+
+def is_quota_exhausted(
+    category: str, retry_seconds: int | None, threshold: int = 300
+) -> bool:
+    """Decide whether a 429 means the egress IP's budget is spent.
+
+    Transient limits are reported with short Retry-After values (seconds or a
+    few minutes).  Daily quotas report the time until the reset — often many
+    hours — and must not be treated as a burst limit.
+    """
+    return category == "quota" or (
+        retry_seconds is not None and retry_seconds >= threshold
+    )

@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY rate_limits.py .
 COPY rotator.py .
+COPY ip_blocklist.py .
 COPY templates/ ./templates/
 
 EXPOSE 8000

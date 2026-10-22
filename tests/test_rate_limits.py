@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import rotator
-from rate_limits import classify_upstream_429
+from rate_limits import classify_upstream_429, is_quota_exhausted
 
 
 class FakeResponse:
@@ -34,6 +34,18 @@ class RateLimitClassificationTests(unittest.TestCase):
         response = FakeResponse({"error": {"type": "RateLimitError"}}, "not-a-number")
         _, retry_after, _ = classify_upstream_429(response)
         self.assertIsNone(retry_after)
+
+    def test_daily_quota_is_detected_as_exhaustion(self):
+        self.assertTrue(is_quota_exhausted("upstream_rate_limit", 43_291))
+        self.assertTrue(is_quota_exhausted("quota", None))
+
+    def test_short_retry_after_is_not_exhaustion(self):
+        self.assertFalse(is_quota_exhausted("rate_limit", 60))
+        self.assertFalse(is_quota_exhausted("rate_limit", None))
+
+    def test_threshold_boundary(self):
+        self.assertFalse(is_quota_exhausted("upstream_rate_limit", 299, threshold=300))
+        self.assertTrue(is_quota_exhausted("upstream_rate_limit", 300, threshold=300))
 
     def test_missing_lease_table_blocks_rotation_conservatively(self):
         with TemporaryDirectory() as directory:
