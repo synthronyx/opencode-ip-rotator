@@ -46,13 +46,19 @@ Keep these when updating, otherwise the proxy will fail with
 
    - `blocked_egress_ips` in the shared `metrics.db` records each exhausted IP
      until the upstream reset time (`Retry-After`), or 24h when absent.
+   - The blocked address is the family the upstream actually used
+     (`response.local_ip`), not whichever address an IP-echo service happens to
+     return. WARP can keep a sticky IPv4 while rotating IPv6, which previously
+     made successful rotations look "identical".
    - The proxy checks the 429 class: a quota error or
      `Retry-After >= IP_EXHAUSTION_RETRY_AFTER` (default 300s) marks the current
      egress IP, rotates, and retries the request on the fresh IP. Short
      transient limits are still returned as-is.
+   - Rotation on exhaustion is **forced**: a stale streaming lease must not pin
+     the proxy to an address that cannot serve new requests.
    - `rotator.py` refuses to accept a blocklisted IP during rotation (tries
      another registration) and rotates away from a blocklisted address at
-     startup.
+     startup. Periodic rotation also forces when the current IP is blocked.
    - `/metrics` and the dashboard expose the active blocklist.
 
 9. **Model names prefixed with `WARP · `**

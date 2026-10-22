@@ -25,7 +25,14 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTEN
 from curl_cffi import requests as cffi_requests
 import ip_blocklist
 from rate_limits import classify_upstream_429, is_quota_exhausted
-from rotator import flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
+from rotator import (
+    flow_lock,
+    active_flows_count,
+    get_public_ip,
+    get_ip_location,
+    rotation_count,
+    detect_upstream_ip_version,
+)
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -58,7 +65,7 @@ def cached_public_ip(ttl: float = 15.0):
     cached = _public_ip_cache["value"]
     if cached and (now - _public_ip_cache["at"]) < ttl:
         return cached
-    ip = get_public_ip()
+    ip = get_public_ip(detect_upstream_ip_version())
     with _public_ip_cache_lock:
         if ip:
             _public_ip_cache["value"] = ip
@@ -463,6 +470,9 @@ MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "8"))
 # How many exhausted IPs a single request may burn (and rotate away from) before
 # we hand the upstream 429 back to the client.
 MAX_EGRESS_ROTATIONS_PER_REQUEST = int(os.environ.get("MAX_EGRESS_ROTATIONS_PER_REQUEST", "3"))
+# When an IP is exhausted we rotate away; if that fails, tell clients to retry
+# soon instead of sleeping for the dead IP's multi-hour reset.
+CLIENT_EXHAUSTION_RETRY_AFTER = int(os.environ.get("CLIENT_EXHAUSTION_RETRY_AFTER", "60"))
 # Serialise exhaustion handling so two concurrent 429s do not rotate twice.
 _egress_rotation_lock = asyncio.Lock()
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
@@ -639,10 +649,14 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
     )
 
 
-def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
+def upstream_rate_limit_response(
+    response, model_name: str, cap_retry_after: bool = False
+) -> JSONResponse:
     category, retry_seconds, payload = classify_upstream_429(response)
     headers = {"X-Rate-Limit-Reason": category}
     if retry_seconds is not None:
+        if cap_retry_after:
+            retry_seconds = min(retry_seconds, CLIENT_EXHAUSTION_RETRY_AFTER)
         headers["Retry-After"] = str(retry_seconds)
     log.warning(
         "Upstream 429 for model '%s' classified as %s (retry_after=%s); headers=%s payload=%s",
@@ -656,7 +670,10 @@ def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
 
 
 async def rotate_away_from_exhausted_ip(
-    model_name: str, category: str, retry_seconds: Optional[int]
+    response,
+    model_name: str,
+    category: str,
+    retry_seconds: Optional[int],
 ) -> bool:
     """Handle a 429 that means "this egress IP's daily budget is gone".
 
@@ -670,11 +687,19 @@ async def rotate_away_from_exhausted_ip(
     if not exhausted:
         return False
 
-    egress_ip = await asyncio.to_thread(get_public_ip)
+    # The address family upstream actually used (response.local_ip) is the one
+    # whose quota matters. WARP's IPv4 egress can be sticky while IPv6 rotates.
+    local_ip = getattr(response, "local_ip", "") or ""
+    ip_version = 6 if ":" in local_ip else 4 if local_ip else None
+    if ip_version is None:
+        ip_version = await asyncio.to_thread(detect_upstream_ip_version)
+
+    egress_ip = await asyncio.to_thread(get_public_ip, ip_version)
     if not egress_ip:
         log.warning(
-            "Quota exhausted for '%s', but the current egress IP could not be identified.",
+            "Quota exhausted for '%s', but the current IPv%s egress IP could not be identified.",
             model_name,
+            ip_version,
         )
         return False
 
@@ -697,7 +722,7 @@ async def rotate_away_from_exhausted_ip(
     async with _egress_rotation_lock:
         # Another request may have rotated while we waited for the lock.  If so,
         # retry on that fresh IP instead of burning another one.
-        active_ip = await asyncio.to_thread(get_public_ip)
+        active_ip = await asyncio.to_thread(get_public_ip, ip_version)
         if active_ip and active_ip != egress_ip and not ip_blocklist.is_blocked(active_ip):
             log.info(
                 "Egress already rotated %s -> %s by another request; retrying on it.",
@@ -707,7 +732,7 @@ async def rotate_away_from_exhausted_ip(
             return True
 
         rotated, new_ip = await asyncio.to_thread(
-            rotate_egress, f"exhausted egress IP {egress_ip}"
+            rotate_egress, f"exhausted egress IP {egress_ip}", True, ip_version
         )
         if not rotated:
             log.warning(
@@ -736,12 +761,24 @@ async def rotate_away_from_exhausted_ip(
         return True
 
 
-def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
+def rotate_egress(
+    reason: str, force: bool = False, ip_version: Optional[int] = None
+) -> tuple[bool, Optional[str]]:
     """Request rotation from the service that owns the shared WARP namespace."""
+    params = []
+    if force:
+        # An exhausted IP cannot serve traffic; a stale stream lease must not
+        # keep us pinned to it.
+        params.append("force=true")
+    if ip_version in (4, 6):
+        params.append(f"family={ip_version}")
+    url = f"{WARP_ROTATOR_URL}/rotate"
+    if params:
+        url += "?" + "&".join(params)
     try:
         # A fresh registration can need several WARP attempts; give it enough
         # headroom that the client is not told "rotation failed" mid-cycle.
-        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=90)
+        response = cffi_requests.post(url, timeout=90)
         data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         if response.status_code == 200 and data.get("status") == "success":
             return True, data.get("verified_ip")
@@ -1051,15 +1088,20 @@ async def chat_completions(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
                 category, retry_seconds, _ = classify_upstream_429(response)
+                exhausted = is_quota_exhausted(
+                    category, retry_seconds, ip_blocklist.EXHAUSTION_RETRY_AFTER_SECONDS
+                )
                 if (
                     rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
                     and await rotate_away_from_exhausted_ip(
-                        current_model, category, retry_seconds
+                        response, current_model, category, retry_seconds
                     )
                 ):
                     rotations_done += 1
                     continue
-                return upstream_rate_limit_response(response, current_model)
+                return upstream_rate_limit_response(
+                    response, current_model, cap_retry_after=exhausted
+                )
 
             if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -1178,15 +1220,20 @@ async def anthropic_messages(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
                 category, retry_seconds, _ = classify_upstream_429(response)
+                exhausted = is_quota_exhausted(
+                    category, retry_seconds, ip_blocklist.EXHAUSTION_RETRY_AFTER_SECONDS
+                )
                 if (
                     rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
                     and await rotate_away_from_exhausted_ip(
-                        model_name, category, retry_seconds
+                        response, model_name, category, retry_seconds
                     )
                 ):
                     rotations_done += 1
                     continue
-                return upstream_rate_limit_response(response, model_name)
+                return upstream_rate_limit_response(
+                    response, model_name, cap_retry_after=exhausted
+                )
 
             if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -1275,15 +1322,20 @@ async def responses_endpoint(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
                 category, retry_seconds, _ = classify_upstream_429(response)
+                exhausted = is_quota_exhausted(
+                    category, retry_seconds, ip_blocklist.EXHAUSTION_RETRY_AFTER_SECONDS
+                )
                 if (
                     rotations_done < MAX_EGRESS_ROTATIONS_PER_REQUEST
                     and await rotate_away_from_exhausted_ip(
-                        model_name, category, retry_seconds
+                        response, model_name, category, retry_seconds
                     )
                 ):
                     rotations_done += 1
                     continue
-                return upstream_rate_limit_response(response, model_name)
+                return upstream_rate_limit_response(
+                    response, model_name, cap_retry_after=exhausted
+                )
 
             if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)

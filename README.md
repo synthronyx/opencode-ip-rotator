@@ -206,6 +206,7 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `IP_EXHAUSTION_RETRY_AFTER` | `300` | A 429 `Retry-After` at/above this many seconds means the IP's daily quota is gone |
 | `IP_EXHAUSTION_BLOCK_SECONDS` | `86400` | Fallback block duration when upstream sends no reset time |
 | `MAX_EGRESS_ROTATIONS_PER_REQUEST` | `3` | Exhausted IPs one request may rotate away from before returning 429 |
+| `CLIENT_EXHAUSTION_RETRY_AFTER` | `60` | `Retry-After` sent to clients when every IP was exhausted, instead of the dead IP's multi-hour reset |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
@@ -289,6 +290,13 @@ This fork keeps those addresses in a shared SQLite table
   startup, trying another registration instead;
 - transient limits (short `Retry-After`, e.g. 30–60s) are **not** blocked.
 
+The blocklist records the address family the upstream actually uses, detected
+from the live connection. This matters: WARP commonly keeps a **sticky IPv4**
+while rotating its **IPv6** address. Blocking the sticky IPv4 made every
+rotation look "identical" and be rejected, even though the address upstream saw
+had changed. Rotation is now forced when an IP is exhausted, so a stale stream
+lease cannot pin the proxy to a dead address.
+
 Inspect the blocklist:
 
 ```bash
@@ -318,7 +326,7 @@ with ip_blocklist._connect() as c:
 | `Invalid ... stream event` | SSE separator bug — apply fix 3 (blank lines while buffering). |
 | `Retry due · attempt N · Timed out waiting for response headers` | OpenCode gives up after ~5 min per attempt. A WARP path stalled and the proxy waited too long before retrying. Fixed by fixes 5 and 6; tune `UPSTREAM_STREAM_TIMEOUT` if you still see it. |
 | Dashboard/`/health` slow or unresponsive while chatting | Blocking upstream calls froze the event loop. Fixed by fix 5 — check you are running this fork, not upstream. |
-| `429` with a multi-hour `Retry-After` | That egress IP burned its daily quota. The proxy should block it and rotate automatically. If the 429 still reaches you, rotation could not run (e.g. streams active); check **Blocked Egress IPs** on the dashboard or `/metrics`, then retry. |
+| `429` with a multi-hour `Retry-After` | That egress IP burned its daily quota. The proxy blocks the family upstream actually uses, force-rotates, and retries. If the 429 still reaches you, rotation could not obtain a new address; check **Blocked Egress IPs** on the dashboard or `/metrics`. |
 | Dashboard shows blocked IPs but chats still 429 | All rotation attempts landed on exhausted addresses. Wait for the reset shown in *Blocked Until*, or add residential proxies via `PROXY_LIST`. |
 | Dashboard up, `/v1/models` empty | Upstream discovery failed or WARP not connected: `docker compose logs warp-rotator`. |
 | Container exits: cannot create `/dev/net/tun` | Enable the tun module on the host: `sudo modprobe tun`, then `docker compose up -d`. |

@@ -128,21 +128,75 @@ def has_active_flow_leases() -> bool:
         return True
 
 
-def get_public_ip() -> Optional[str]:
-    """Fetches current public IP using Chrome TLS impersonation."""
+def get_public_ip(ip_version: Optional[int] = None) -> Optional[str]:
+    """Fetches the public egress IP using Chrome TLS impersonation.
+
+    ``ip_version`` pins the address family (4 or 6).  This matters because WARP
+    can hand out a sticky IPv4 while rotating its IPv6 address; verifying only
+    one family can make a successful rotation look like a failure.
+    """
+    endpoints = {
+        4: ("https://ipv4.icanhazip.com", "text"),
+        6: ("https://ipv6.icanhazip.com", "text"),
+    }
+    url, mode = endpoints.get(ip_version, ("https://api.ipify.org?format=json", "json"))
     try:
         from curl_cffi import requests
-        resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=5)
+        resp = requests.get(url, impersonate="chrome124", timeout=8)
         if resp.status_code == 200:
-            return resp.json().get("ip")
+            return resp.json().get("ip") if mode == "json" else resp.text.strip()
     except Exception:
-        try:
-            from curl_cffi import requests
-            resp = requests.get("https://ifconfig.me/ip", impersonate="chrome124", timeout=5)
-            if resp.status_code == 200:
-                return resp.text.strip()
-        except Exception:
-            return None
+        pass
+    # Fall back to a dual-stack echo service.
+    try:
+        from curl_cffi import requests
+        resp = requests.get("https://ifconfig.me/ip", impersonate="chrome124", timeout=8)
+        if resp.status_code == 200:
+            ip = resp.text.strip()
+            if ip_version is None:
+                return ip
+            if ":" in ip and ip_version == 6:
+                return ip
+            if ":" not in ip and ip_version == 4:
+                return ip
+    except Exception:
+        pass
+    return None
+
+
+_upstream_ip_version: Optional[int] = None
+
+
+def detect_upstream_ip_version() -> int:
+    """Return the address family the upstream connection actually uses.
+
+    WARP's IPv4 egress can be sticky for a colo while IPv6 changes on every
+    registration.  Blocking/verifying the wrong family makes rotations fail
+    even though the address the upstream sees did change.
+    """
+    global _upstream_ip_version
+    if _upstream_ip_version in (4, 6):
+        return _upstream_ip_version
+    try:
+        from curl_cffi import requests
+        resp = requests.get(
+            "https://opencode.ai/", impersonate="chrome124", timeout=10
+        )
+        local_ip = getattr(resp, "local_ip", "") or ""
+        if local_ip:
+            version = 6 if ":" in local_ip else 4
+            # Only cache IPv6. Right after WARP connects, IPv6 may not be up
+            # yet and a single probe reports IPv4; caching that would make
+            # later rotations verify the sticky IPv4 address forever.
+            if version == 6:
+                _upstream_ip_version = 6
+            log.info("Upstream egress family detected: IPv%s", version)
+            return version
+    except Exception:
+        pass
+    # Do not cache a guess: a transient probe failure must not pin us to the
+    # wrong family for the lifetime of the process.
+    return 4
 
 
 def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
@@ -224,16 +278,27 @@ def get_warp_bin() -> str:
 # -----------------------------------------------------------------------------
 # WARP Controller with IP Verification & Auto-Recycle Trigger
 # -----------------------------------------------------------------------------
-def rotate_warp(reason: str = "Triggered") -> bool:
+def rotate_warp(
+    reason: str = "Triggered",
+    force: bool = False,
+    ip_version: Optional[int] = None,
+) -> bool:
     global _current_ip, rotation_count
     with rotation_lock:
         with flow_lock:
             if active_flows_count > 0 or has_active_flow_leases():
-                log.info("IP rotation skipped — an active streaming flow lease is in progress.")
-                return False
+                if not force:
+                    log.info("IP rotation skipped — an active streaming flow lease is in progress.")
+                    return False
+                log.warning(
+                    "Forcing IP rotation despite active stream lease(s). Reason: %s",
+                    reason,
+                )
 
-            old_ip = _current_ip or get_public_ip()
-            log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
+            if ip_version not in (4, 6):
+                ip_version = detect_upstream_ip_version()
+            old_ip = get_public_ip(ip_version) or _current_ip
+            log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IPv{ip_version}: {old_ip})")
 
             # Try local WARP CLI rotation first
             warp_bin = get_warp_bin()
@@ -254,7 +319,7 @@ def rotate_warp(reason: str = "Triggered") -> bool:
 
                         if res.returncode == 0:
                             time.sleep(3)
-                            new_ip = get_public_ip()
+                            new_ip = get_public_ip(ip_version)
 
                             if (
                                 new_ip
@@ -412,6 +477,7 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
         stop_event.wait(interval)
 
 def periodic_rotation_loop(interval: int, stop_event: threading.Event) -> None:
+    global _current_ip
     if interval <= 0:
         return
 
@@ -419,6 +485,20 @@ def periodic_rotation_loop(interval: int, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         if stop_event.wait(interval):
             break
+        ip_version = detect_upstream_ip_version()
+        live_ip = get_public_ip(ip_version)
+        if live_ip:
+            _current_ip = live_ip
+        blocked = ip_blocklist.is_blocked(_current_ip)
+        if blocked:
+            # An exhausted IP cannot serve new requests; do not let a stale
+            # stream lease pin us to it.
+            log.warning(
+                "Current egress IP %s is blocklisted; forcing scheduled rotation.",
+                _current_ip,
+            )
+            rotate_warp(reason="Scheduled Interval (blocked IP)", force=True)
+            continue
         if has_active_flow_leases():
             log.info("Scheduled IP rotation deferred — an active streaming flow lease is in progress.")
             continue
@@ -437,8 +517,12 @@ def start_rotator_http_server():
             return {"status": "healthy", "current_ip": _current_ip, "rotations": rotation_count}
 
         @rotator_app.post("/rotate")
-        def http_rotate():
-            success = rotate_warp(reason="Remote HTTP Dashboard Trigger")
+        def http_rotate(force: bool = False, family: Optional[int] = None):
+            success = rotate_warp(
+                reason="Remote HTTP Dashboard Trigger",
+                force=force,
+                ip_version=family,
+            )
             return {"status": "success" if success else "failed", "verified_ip": _current_ip}
         
         @rotator_app.get("/status")
@@ -466,8 +550,21 @@ def main() -> None:
     load_proxy_list()
     ip_blocklist.init_db()
     global _current_ip
-    _current_ip = get_public_ip()
-    log.info(f"Starting IP Rotator Node... Initial Verified Public IP: {_current_ip}")
+    # WARP's IPv6 route can take a few seconds to come up after the tunnel
+    # connects. Wait briefly so detection does not latch onto the sticky IPv4.
+    for attempt in range(6):
+        if get_public_ip(6):
+            break
+        if attempt < 5:
+            time.sleep(5)
+    ip_version = 4
+    for attempt in range(3):
+        ip_version = detect_upstream_ip_version()
+        if ip_version == 6:
+            break
+        time.sleep(5)
+    _current_ip = get_public_ip(ip_version)
+    log.info(f"Starting IP Rotator Node... Initial Verified Public IPv{ip_version}: {_current_ip}")
 
     blocked_until = ip_blocklist.blocked_until(_current_ip)
     if _current_ip and blocked_until:
