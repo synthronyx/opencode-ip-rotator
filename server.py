@@ -563,6 +563,9 @@ def get_realistic_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
         "Accept": "application/json, text/event-stream, */*",
+        # The upstream free-tier gate rejects clients that do not advertise a
+        # compressing Accept-Encoding, so always negotiate compression.
+        "Accept-Encoding": "gzip, deflate, br",
         "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
 
@@ -666,6 +669,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
     last_raw_line = ""
     buffered_lines = []
     has_meaningful_content = False
+    saw_done = False
 
     try:
         def get_next_line(iter_lines):
@@ -695,6 +699,11 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                         if '"choices":[]' not in raw_text.replace(" ", ""):
                             has_meaningful_content = True
                             break
+            else:
+                # Keep blank lines: they are the SSE event separators between
+                # `data:` frames. Dropping them merges consecutive chunks into
+                # one malformed event and clients reject the stream.
+                buffered_lines.append(line)
 
         # If stream ended prematurely without producing any meaningful content or tool calls
         if not has_meaningful_content and len(buffered_lines) < 4:
@@ -706,6 +715,8 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
         # Yield buffered initial lines
         for b_line in buffered_lines:
             chunk_count += 1
+            if b"[DONE]" in b_line:
+                saw_done = True
             yield b_line + b"\n"
 
         # Step 2: Continue streaming remaining lines
@@ -721,6 +732,8 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
             line = item
             if line:
                 chunk_count += 1
+                if b"[DONE]" in line:
+                    saw_done = True
                 try:
                     last_raw_line = line.decode("utf-8", errors="ignore")
                 except Exception:
@@ -730,7 +743,8 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 yield b"\n"
 
         log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
-        yield b"\ndata: [DONE]\n\n"
+        if not saw_done:
+            yield b"\ndata: [DONE]\n\n"
     except EmptyStreamError:
         raise
     except GeneratorExit:
@@ -901,7 +915,8 @@ async def chat_completions(raw_request: Request):
 
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
+        kl = k.lower()
+        if kl.startswith("x-opencode-") or kl == "user-agent":
             headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
@@ -1017,7 +1032,7 @@ async def anthropic_messages(raw_request: Request):
 
     for k, v in raw_request.headers.items():
         kl = k.lower()
-        if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
+        if kl.startswith("x-opencode-") or kl.startswith("anthropic-") or kl == "user-agent":
             headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
@@ -1103,7 +1118,7 @@ async def responses_endpoint(raw_request: Request):
 
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
+        if k.lower().startswith("x-opencode-") or k.lower() == "user-agent":
             headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
