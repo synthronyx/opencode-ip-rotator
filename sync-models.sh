@@ -27,7 +27,12 @@ current = provider.get("models", {})
 synced = {}
 for m in models:
     mid = m["id"]
-    synced[mid] = current.get(mid, {}) or {"name": m.get("name", mid)}
+    label = (current.get(mid) or {}).get("name") or m.get("name", mid)
+    # Prefix so the proxied entry is distinguishable from the identical
+    # built-in "opencode" provider entry in /models.
+    if not label.startswith("WARP · "):
+        label = "WARP · " + label
+    synced[mid] = {**(current.get(mid) or {}), "name": label}
 
 provider["models"] = synced
 with open(config_path, "w", encoding="utf-8") as f:

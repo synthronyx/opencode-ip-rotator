@@ -21,6 +21,24 @@ Keep these when updating, otherwise the proxy will fail with
    The proxy now only emits `[DONE]` when the upstream stream did not already
    send one.
 
+5. **Upstream HTTP calls moved off the event loop**
+   `session.post(...)` is a synchronous `curl_cffi` call. Running it directly in
+   the async handlers froze the entire server for the duration of the upstream
+   request (a 20s upstream delay made `/health` take 20s). All three endpoints
+   now use `await asyncio.to_thread(...)`, so requests are handled concurrently.
+
+6. **Faster failure on stalled upstream connections**
+   The libcurl low-speed timeout was 600s, so a dead WARP path blocked a request
+   for ten minutes before retrying — longer than OpenCode's 5-minute header
+   timeout, which surfaced as `Timed out waiting for response headers`.
+   It is now `UPSTREAM_STREAM_TIMEOUT` (default `150` seconds), so the proxy
+   retries well before the client gives up.
+
+7. **Cached public IP for `/health`**
+   `get_public_ip()` performs a blocking HTTP lookup (5s timeout, plus a 5s
+   fallback). `/health` called it synchronously on every poll; the result is now
+   cached for 15s and resolved in a worker thread.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.

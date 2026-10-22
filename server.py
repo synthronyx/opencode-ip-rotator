@@ -42,9 +42,27 @@ MODEL_DISCOVERY_INTERVAL = 300
 DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
-STREAM_TIMEOUT = 600
+STREAM_TIMEOUT = int(os.environ.get("UPSTREAM_STREAM_TIMEOUT", "150"))
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
 FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
+
+# get_public_ip() performs a blocking HTTP lookup; cache it so the dashboard's
+# frequent /metrics and /health polls do not hit an external service each time.
+_public_ip_cache = {"value": None, "at": 0.0}
+_public_ip_cache_lock = threading.Lock()
+
+
+def cached_public_ip(ttl: float = 15.0):
+    now = time.monotonic()
+    cached = _public_ip_cache["value"]
+    if cached and (now - _public_ip_cache["at"]) < ttl:
+        return cached
+    ip = get_public_ip()
+    with _public_ip_cache_lock:
+        if ip:
+            _public_ip_cache["value"] = ip
+            _public_ip_cache["at"] = now
+    return ip or cached
 
 # -----------------------------------------------------------------------------
 # JSON Structured Logging
@@ -864,7 +882,7 @@ async def get_metrics():
 
 @app.get("/health")
 async def health():
-    ip = get_public_ip()
+    ip = await asyncio.to_thread(cached_public_ip)
     prom_warp_health.set(1 if ip and ip != "Disconnected" else 0)
     db_ok = False
     try:
@@ -924,14 +942,15 @@ async def chat_completions(raw_request: Request):
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_URL,
                 json=payload,
                 headers=headers,
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120
+                timeout=STREAM_TIMEOUT if is_stream else 120,
             )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
@@ -1040,7 +1059,8 @@ async def anthropic_messages(raw_request: Request):
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_ANTHROPIC_URL,
                 json=body,
                 headers=headers,
@@ -1126,7 +1146,8 @@ async def responses_endpoint(raw_request: Request):
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
                 headers=headers,

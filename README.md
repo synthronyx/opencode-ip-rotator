@@ -202,6 +202,7 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `WARP_ROTATION_INTERVAL` | `300` | Seconds between rotations |
 | `WARP_CHECK_INTERVAL` | `15` | WARP health check interval |
 | `OPENCODE_ZEN_PORT` | `8000` | Proxy port |
+| `UPSTREAM_STREAM_TIMEOUT` | `150` | Seconds without upstream bytes before the proxy aborts and retries |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
@@ -264,6 +265,8 @@ Files changed vs upstream: `server.py` (4 fixes), plus new `sync-models.sh`,
 | `FreeTierError` in logs, empty replies | You are on upstream code without the patches. Apply the `server.py` fixes in `PATCHES.md`. |
 | `OpenAI Chat stream ended without finish_reason` | Same as above: an upstream error is being streamed as an empty body. Check `docker compose logs proxy-server`. |
 | `Invalid ... stream event` | SSE separator bug — apply fix 3 (blank lines while buffering). |
+| `Retry due · attempt N · Timed out waiting for response headers` | OpenCode gives up after ~5 min per attempt. A WARP path stalled and the proxy waited too long before retrying. Fixed by fixes 5 and 6; tune `UPSTREAM_STREAM_TIMEOUT` if you still see it. |
+| Dashboard/`/health` slow or unresponsive while chatting | Blocking upstream calls froze the event loop. Fixed by fix 5 — check you are running this fork, not upstream. |
 | Dashboard up, `/v1/models` empty | Upstream discovery failed or WARP not connected: `docker compose logs warp-rotator`. |
 | Container exits: cannot create `/dev/net/tun` | Enable the tun module on the host: `sudo modprobe tun`, then `docker compose up -d`. |
 | `bind: address already in use` on 8000 | Something else uses port 8000. Change the `8000:8000` mapping in `docker-compose.yml` and the provider `baseURL`. |
