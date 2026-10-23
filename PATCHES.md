@@ -86,6 +86,24 @@ Keep these when updating, otherwise the proxy will fail with
     - `MODEL_PRICING_JSON` can override the reference USD-per-1M rates used for
       the paid-equivalent cost estimate.
 
+11. **Standalone OpenAI-compatible endpoint**
+    `/v1/chat/completions` now works for clients that are not OpenCode (curl,
+    OpenAI SDK, LangChain, ...).
+
+    - The free-tier gate requires a syntactically valid OpenCode session ID
+      (`ses_` + 12 inverted hex timestamp digits + 14 base62 characters), an
+      `opencode/latest/<version>/cli` user agent, an `x-opencode-project` ID,
+      `stream: true`, and a tool named `read`. The proxy synthesises all of
+      these for non-OpenCode clients (`standalone.py`).
+    - `read` is added only when missing; when it is the only tool the proxy sets
+      `tool_choice: "none"` so the model never calls the placeholder.
+    - Because the gate rejects non-streaming requests, the proxy always streams
+      upstream and aggregates the SSE chunks into a normal `chat.completion`
+      JSON object for callers that requested `stream: false`.
+    - Sessions are reused per `user` field (or API key), and can be pinned with
+      `X-Session-Id`. Optional `STANDALONE_API_KEY` protects every `/v1/*`
+      endpoint.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.

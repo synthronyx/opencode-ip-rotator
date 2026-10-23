@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
+import secrets
 import signal
 import sqlite3
 import threading
@@ -42,6 +44,12 @@ from rotator import (
     rotation_count,
     detect_upstream_ip_version,
 )
+from standalone import (
+    ensure_standalone_tools,
+    is_opencode_client,
+    mint_session_id,
+    requested_session_id,
+)
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -62,6 +70,9 @@ ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", 
 STREAM_TIMEOUT = int(os.environ.get("UPSTREAM_STREAM_TIMEOUT", "150"))
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
 FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
+EMULATED_OPENCODE_VERSION = os.environ.get("OPENCODE_EMULATED_VERSION", "2.1.1").strip() or "2.1.1"
+STANDALONE_API_KEY = os.environ.get("STANDALONE_API_KEY", "").strip()
+STANDALONE_SESSION_LIMIT = 1024
 
 # get_public_ip() performs a blocking HTTP lookup; cache it so the dashboard's
 # frequent /metrics and /health polls do not hit an external service each time.
@@ -651,6 +662,105 @@ def get_realistic_headers() -> Dict[str, str]:
     }
 
 
+def request_api_key(raw_request: Request) -> str:
+    """Extract a bearer token or Anthropic-style x-api-key from a request."""
+    authorization = raw_request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return (raw_request.headers.get("x-api-key") or "").strip()
+
+
+def standalone_auth_error(raw_request: Request) -> Optional[JSONResponse]:
+    """Return a 401 response when STANDALONE_API_KEY is configured and wrong."""
+    if not STANDALONE_API_KEY:
+        return None
+    if secrets.compare_digest(request_api_key(raw_request), STANDALONE_API_KEY):
+        return None
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": "Invalid API key",
+                "type": "authentication_error",
+                "code": "invalid_api_key",
+            }
+        },
+    )
+
+
+def standalone_project_id(raw_request: Request) -> str:
+    """Stable 40-hex project ID so each consumer gets its own upstream cache."""
+    key = request_api_key(raw_request) or "anonymous"
+    return hashlib.sha1(("opencode-ip-rotator:" + key).encode("utf-8")).hexdigest()
+
+
+_standalone_sessions: Dict[str, str] = {}
+_standalone_sessions_lock = threading.Lock()
+
+
+def standalone_session_id(raw_request: Request, payload: Optional[dict]) -> str:
+    """Reuse one minted session per API user so prompt caches stay warm."""
+    explicit = requested_session_id(raw_request.headers, payload)
+    if explicit:
+        return explicit
+    payload = payload or {}
+    key = str(payload.get("user") or "default")
+    with _standalone_sessions_lock:
+        session_id = _standalone_sessions.get(key)
+        if not session_id:
+            if len(_standalone_sessions) >= STANDALONE_SESSION_LIMIT:
+                _standalone_sessions.clear()
+            session_id = mint_session_id()
+            _standalone_sessions[key] = session_id
+        return session_id
+
+
+def build_upstream_headers(
+    raw_request: Request,
+    payload: Optional[dict] = None,
+    forward_prefixes: tuple = (),
+) -> Dict[str, str]:
+    """Build headers that satisfy the free-tier gate for any client.
+
+    Requests from OpenCode are forwarded untouched. Everything else (curl, the
+    OpenAI SDK, ...) gets a valid emulated OpenCode identity, which turns the
+    proxy into a standalone OpenAI-compatible endpoint.
+    """
+    headers = get_realistic_headers()
+    passthrough = ("x-opencode-",) + tuple(forward_prefixes)
+
+    if is_opencode_client(raw_request.headers, payload):
+        for key, value in raw_request.headers.items():
+            lower = key.lower()
+            if lower == "user-agent" or any(
+                lower.startswith(prefix) for prefix in passthrough
+            ):
+                headers[key] = value
+        return headers
+
+    session_id = standalone_session_id(raw_request, payload)
+    trace_id = uuid.uuid4().hex
+    span_id = uuid.uuid4().hex[:16]
+    headers.update(
+        {
+            "User-Agent": f"opencode/latest/{EMULATED_OPENCODE_VERSION}/cli",
+            "x-opencode-client": "cli",
+            "x-opencode-project": standalone_project_id(raw_request),
+            "x-opencode-session": session_id,
+            "x-opencode-session-id": session_id,
+            "x-session-affinity": session_id,
+            "X-Session-Id": session_id,
+            "b3": f"{trace_id}-{span_id}-1-{uuid.uuid4().hex[:16]}",
+            "traceparent": f"00-{trace_id}-{span_id}-01",
+        }
+    )
+    for key, value in raw_request.headers.items():
+        lower = key.lower()
+        if any(lower.startswith(prefix) for prefix in forward_prefixes):
+            headers[key] = value
+    return headers
+
+
 SAFE_UPSTREAM_HEADERS = {
     "content-type",
     "retry-after",
@@ -836,6 +946,114 @@ def rotate_egress(
 class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
     pass
+
+
+def aggregate_chat_stream(response, model_name: str, prompt_tokens_estimate: int = 0):
+    """Fold an upstream SSE stream into one OpenAI ``chat.completion`` object.
+
+    The free tier only accepts streaming requests, so non-streaming standalone
+    clients are served by collecting the stream here.
+    """
+    stats = new_stream_stats()
+    message = {"role": "assistant", "content": ""}
+    tool_calls: Dict[int, dict] = {}
+    content_parts = []
+    reasoning_parts = []
+    finish_reason = None
+    usage = None
+    response_id = None
+    created = None
+    model = None
+
+    try:
+        for line in response.iter_lines():
+            if not line:
+                continue
+            raw = line.decode("utf-8", errors="ignore").strip()
+            observe_stream_event(raw, stats)
+            if not raw.startswith("data:"):
+                continue
+            data = raw[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                event = json.loads(data)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            response_id = event.get("id") or response_id
+            created = event.get("created") or created
+            model = event.get("model") or model
+
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                if isinstance(delta.get("content"), str):
+                    content_parts.append(delta["content"])
+                if isinstance(delta.get("reasoning_content"), str):
+                    reasoning_parts.append(delta["reasoning_content"])
+                for tool_call in delta.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    index = tool_call.get("index", 0)
+                    slot = tool_calls.setdefault(
+                        index,
+                        {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    if tool_call.get("id"):
+                        slot["id"] = tool_call["id"]
+                    if tool_call.get("type"):
+                        slot["type"] = tool_call["type"]
+                    function = tool_call.get("function") or {}
+                    if function.get("name"):
+                        slot["function"]["name"] += function["name"]
+                    if function.get("arguments"):
+                        slot["function"]["arguments"] += function["arguments"]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    if not content_parts and not reasoning_parts and not tool_calls and not usage:
+        raise EmptyStreamError("Upstream returned an empty response stream")
+
+    message["content"] = "".join(content_parts)
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+
+    result = {
+        "id": response_id or f"chatcmpl-zen-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": created or int(time.time()),
+        "model": model or model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+    }
+    if usage:
+        result["usage"] = usage
+    return result, stats
+
 
 async def stream_response(
     response,
@@ -1109,7 +1327,10 @@ async def health():
     }
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(raw_request: Request):
+    auth_failure = standalone_auth_error(raw_request)
+    if auth_failure:
+        return auth_failure
     with _discovery_lock:
         return {
             "object": "list",
@@ -1128,6 +1349,9 @@ async def list_models():
 async def chat_completions(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="chat", endpoint="chat_completions").inc()
+    auth_failure = standalone_auth_error(raw_request)
+    if auth_failure:
+        return auth_failure
     await wait_for_rotation_drain()
 
     start_time = time.time()
@@ -1137,11 +1361,18 @@ async def chat_completions(raw_request: Request):
         payload = {}
 
     current_model = payload.get("model", "deepseek-v4-flash-free")
-    is_stream = payload.get("stream", False)
-    log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
+    standalone_client = not is_opencode_client(raw_request.headers, payload)
+    client_stream = bool(payload.get("stream", False))
+    # The free-tier gate only accepts streaming requests, so standalone clients
+    # are always streamed upstream even when they asked for a single response.
+    upstream_stream = bool(client_stream or standalone_client)
+    if standalone_client:
+        ensure_standalone_tools(payload)
+    payload["stream"] = upstream_stream
+    log.info(f"Received request for model '{current_model}' (Stream: {client_stream} | Has Tools: {'tools' in payload} | Standalone: {standalone_client})")
 
     prompt_tokens_estimate = estimate_prompt_tokens(payload)
-    if is_stream:
+    if upstream_stream:
         # Ask OpenAI-compatible upstreams for an exact usage report in the final
         # SSE chunk. OpenCode already sends this; other clients may not.
         stream_options = payload.get("stream_options")
@@ -1150,27 +1381,23 @@ async def chat_completions(raw_request: Request):
         stream_options.setdefault("include_usage", True)
         payload["stream_options"] = stream_options
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        kl = k.lower()
-        if kl.startswith("x-opencode-") or kl == "user-agent":
-            headers[k] = v
+    headers = build_upstream_headers(raw_request, payload)
 
     rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
+            session = create_fresh_session(upstream_stream) if upstream_stream else _get_session("chat")
             response = await asyncio.to_thread(
                 session.post,
                 TARGET_ZEN_URL,
                 json=payload,
                 headers=headers,
                 impersonate="chrome124",
-                stream=is_stream,
+                stream=upstream_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=STREAM_TIMEOUT if upstream_stream else 120,
             )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
@@ -1203,7 +1430,7 @@ async def chat_completions(raw_request: Request):
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
 
-            if is_stream:
+            if client_stream:
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     stream_gen = stream_response(
@@ -1222,6 +1449,32 @@ async def chat_completions(raw_request: Request):
                     delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     await asyncio.sleep(delay)
                     continue
+            elif standalone_client:
+                # The client asked for a single JSON response but the gate
+                # requires streaming upstream, so fold the stream back into one
+                # chat.completion object.
+                with FlowContext():
+                    try:
+                        res_json, usage_stats = await asyncio.to_thread(
+                            aggregate_chat_stream,
+                            response,
+                            current_model,
+                            prompt_tokens_estimate,
+                        )
+                    except EmptyStreamError:
+                        log.warning("Empty stream for '%s'; retrying (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                        delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                        await asyncio.sleep(delay)
+                        continue
+                    except Exception as exc:
+                        log.warning("Failed to aggregate stream for '%s': %s", current_model, exc)
+                        delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                        await asyncio.sleep(delay)
+                        continue
+                    recorded_usage = finalize_usage(usage_stats, prompt_tokens_estimate)
+                    if recorded_usage:
+                        track_token_usage(current_model, *recorded_usage)
+                    return JSONResponse(content=res_json)
             else:
                 with FlowContext():
                     try:
@@ -1267,6 +1520,9 @@ async def chat_completions(raw_request: Request):
 async def anthropic_messages(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="messages", endpoint="anthropic_messages").inc()
+    auth_failure = standalone_auth_error(raw_request)
+    if auth_failure:
+        return auth_failure
     await wait_for_rotation_drain()
 
     start_time = time.time()
@@ -1286,13 +1542,14 @@ async def anthropic_messages(raw_request: Request):
         if auth.startswith("Bearer "):
             client_api_key = auth[7:]
 
-    headers = get_realistic_headers()
-    headers["x-api-key"] = client_api_key or "public"
-
-    for k, v in raw_request.headers.items():
-        kl = k.lower()
-        if kl.startswith("x-opencode-") or kl.startswith("anthropic-") or kl == "user-agent":
-            headers[k] = v
+    headers = build_upstream_headers(
+        raw_request, body, forward_prefixes=("anthropic-",)
+    )
+    headers["x-api-key"] = (
+        (client_api_key or "public")
+        if is_opencode_client(raw_request.headers, body)
+        else "public"
+    )
 
     rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
@@ -1388,6 +1645,9 @@ async def anthropic_messages(raw_request: Request):
 async def responses_endpoint(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="responses", endpoint="responses").inc()
+    auth_failure = standalone_auth_error(raw_request)
+    if auth_failure:
+        return auth_failure
     await wait_for_rotation_drain()
 
     start_time = time.time()
@@ -1401,10 +1661,7 @@ async def responses_endpoint(raw_request: Request):
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
     prompt_tokens_estimate = estimate_prompt_tokens(body)
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-") or k.lower() == "user-agent":
-            headers[k] = v
+    headers = build_upstream_headers(raw_request, body)
 
     rotations_done = 0
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):

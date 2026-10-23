@@ -160,6 +160,71 @@ The proxy also exposes `/v1/messages`:
 
 ---
 
+## Standalone OpenAI-compatible API
+
+`/v1/chat/completions` also works with any generic OpenAI client — curl, the
+OpenAI SDK, LangChain, and so on. The proxy detects non-OpenCode requests and
+supplies the upstream free-tier identity itself (a valid session, project ID,
+trace headers, and the `read` tool the gate expects), so callers do not need
+OpenCode installed.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4.1-flash-free",
+    "messages": [{"role": "user", "content": "Reply with exactly: hello"}]
+  }'
+```
+
+Streaming works as usual:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek-v4.1-flash-free",
+    "stream": true,
+    "messages": [{"role": "user", "content": "hello"}]
+  }'
+```
+
+Python with the OpenAI SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="public")
+response = client.chat.completions.create(
+    model="deepseek-v4.1-flash-free",
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(response.choices[0].message.content)
+```
+
+How the compatibility layer behaves:
+
+- **Streaming upstream, JSON to the caller.** The free-tier gate only accepts
+  streaming requests. The proxy always streams upstream and, for callers that
+  send `"stream": false` (the OpenAI default), folds the SSE chunks back into a
+  single `chat.completion` JSON response.
+- **Synthetic `read` tool.** The gate requires a tool named `read`. If a request
+  has no tools, the proxy adds a placeholder and sets `tool_choice: "none"` so
+  the model cannot call it. If you pass your own tools, the placeholder is added
+  only when your set does not already contain `read`, and your `tool_choice` is
+  preserved.
+- **Session affinity.** Standalone sessions are reused per `user` field (or per
+  API key) to keep upstream prompt caches warm. Send
+  `X-Session-Id: ses_...` to pin a session explicitly.
+- **OpenCode is untouched.** Requests that carry OpenCode headers (or an
+  `opencode` user agent) are forwarded with their original identity.
+- **Optional auth.** Set `STANDALONE_API_KEY` to require
+  `Authorization: Bearer <key>` (or `x-api-key`) on every `/v1/*` endpoint.
+  When set, configure the same key in OpenCode's provider `apiKey`.
+- `/v1/models` lists the currently discovered free models.
+
+---
+
 ## Day-to-day operations
 
 ```bash
@@ -187,7 +252,7 @@ Endpoints:
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/v1/chat/completions` | POST | OpenAI-compatible (used by OpenCode) |
+| `/v1/chat/completions` | POST | OpenAI-compatible (OpenCode and standalone clients) |
 | `/v1/messages` | POST | Anthropic-compatible |
 | `/v1/models` | GET | Currently discovered free models |
 | `/dashboard` | GET | Web UI (IP, usage, rotation history) |
@@ -208,6 +273,8 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `MAX_EGRESS_ROTATIONS_PER_REQUEST` | `3` | Exhausted IPs one request may rotate away from before returning 429 |
 | `CLIENT_EXHAUSTION_RETRY_AFTER` | `60` | `Retry-After` sent to clients when every IP was exhausted, instead of the dead IP's multi-hour reset |
 | `MODEL_PRICING_JSON` | – | JSON overrides for the USD-per-1M reference rates used in the cost estimate, e.g. `{"glm-5.3-flash-free":{"input_per_1m":0.2,"output_per_1m":0.8,"cache_read_per_1m":0.02}}` |
+| `STANDALONE_API_KEY` | – | When set, `/v1/*` requires `Authorization: Bearer <key>` (or `x-api-key`) |
+| `OPENCODE_EMULATED_VERSION` | `2.1.1` | OpenCode version advertised to upstream for non-OpenCode clients |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
