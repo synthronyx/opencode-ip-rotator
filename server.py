@@ -25,6 +25,14 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTEN
 from curl_cffi import requests as cffi_requests
 import ip_blocklist
 from rate_limits import classify_upstream_429, is_quota_exhausted
+from token_usage import (
+    estimate_completion_tokens,
+    estimate_prompt_tokens,
+    estimate_text_tokens,
+    finalize_usage,
+    new_stream_stats,
+    observe_stream_event,
+)
 from rotator import (
     flow_lock,
     active_flows_count,
@@ -377,6 +385,24 @@ MODEL_PRICING = {
     "ling-3.0-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
     "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
 }
+
+# Optional per-model overrides, e.g.
+# MODEL_PRICING_JSON='{"glm-5.3-flash-free":{"input_per_1m":0.2,"output_per_1m":0.8}}'
+try:
+    _pricing_override = json.loads(os.environ.get("MODEL_PRICING_JSON") or "{}")
+    if isinstance(_pricing_override, dict):
+        for _model, _rates in _pricing_override.items():
+            if (
+                isinstance(_rates, dict)
+                and "input_per_1m" in _rates
+                and "output_per_1m" in _rates
+            ):
+                MODEL_PRICING[_model] = {
+                    "input_per_1m": float(_rates["input_per_1m"]),
+                    "output_per_1m": float(_rates["output_per_1m"]),
+                }
+except (TypeError, ValueError) as exc:
+    log.warning("Ignoring invalid MODEL_PRICING_JSON: %s", exc)
 
 _model_usage_lock = threading.Lock()
 
@@ -791,7 +817,12 @@ class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
     pass
 
-async def stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+async def stream_response(
+    response,
+    model_name: str,
+    session=None,
+    prompt_tokens_estimate: int = 0,
+) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_event_loop()
     global active_flows_count
 
@@ -815,6 +846,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
     buffered_lines = []
     has_meaningful_content = False
     saw_done = False
+    usage_stats = new_stream_stats()
 
     try:
         def get_next_line(iter_lines):
@@ -837,6 +869,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
             line = item
             if line:
                 raw_text = line.decode("utf-8", errors="ignore").strip()
+                observe_stream_event(raw_text, usage_stats)
                 if raw_text and not raw_text.startswith(":"):
                     buffered_lines.append(line)
                     if "content" in raw_text or "tool_calls" in raw_text or "reasoning_content" in raw_text:
@@ -883,6 +916,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                     last_raw_line = line.decode("utf-8", errors="ignore")
                 except Exception:
                     pass
+                observe_stream_event(last_raw_line, usage_stats)
                 yield line + b"\n"
             else:
                 yield b"\n"
@@ -898,6 +932,26 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
         log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
         yield b"\ndata: [DONE]\n\n"
     finally:
+        try:
+            recorded_usage = finalize_usage(usage_stats, prompt_tokens_estimate)
+            if recorded_usage:
+                track_token_usage(model_name, *recorded_usage)
+                log.info(
+                    "Token usage for '%s': prompt=%s completion=%s (%s).",
+                    model_name,
+                    recorded_usage[0],
+                    recorded_usage[1],
+                    "upstream usage" if usage_stats.get("usage") else "estimate",
+                )
+                if usage_stats.get("usage"):
+                    log.debug(
+                        "Context estimate for '%s': %s tokens (upstream prompt=%s).",
+                        model_name,
+                        prompt_tokens_estimate,
+                        recorded_usage[0],
+                    )
+        except Exception as exc:
+            log.warning("Failed to record stream token usage for '%s': %s", model_name, exc)
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
         await asyncio.to_thread(release_flow_lease, lease_id)
@@ -1060,6 +1114,16 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    prompt_tokens_estimate = estimate_prompt_tokens(payload)
+    if is_stream:
+        # Ask OpenAI-compatible upstreams for an exact usage report in the final
+        # SSE chunk. OpenCode already sends this; other clients may not.
+        stream_options = payload.get("stream_options")
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        stream_options.setdefault("include_usage", True)
+        payload["stream_options"] = stream_options
+
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
         kl = k.lower()
@@ -1116,11 +1180,12 @@ async def chat_completions(raw_request: Request):
             if is_stream:
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
-                    stream_gen = stream_response(response, current_model, session=session)
-                    metrics["successful_requests"] += 1
-                    prom_requests_success.labels(model=current_model).inc()
-                    prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
-                    track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    stream_gen = stream_response(
+                        response,
+                        current_model,
+                        session=session,
+                        prompt_tokens_estimate=prompt_tokens_estimate,
+                    )
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
@@ -1135,15 +1200,19 @@ async def chat_completions(raw_request: Request):
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
-                        usage = res_json.get("usage", {})
+                        usage = res_json.get("usage") or {}
                         track_token_usage(
                             current_model,
-                            prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
+                            prompt_tokens=usage.get("prompt_tokens") or prompt_tokens_estimate,
+                            completion_tokens=usage.get("completion_tokens") or estimate_completion_tokens(res_json),
                         )
                         return JSONResponse(content=res_json)
                     except Exception:
-                        track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
+                        track_token_usage(
+                            current_model,
+                            prompt_tokens=prompt_tokens_estimate,
+                            completion_tokens=estimate_text_tokens(response.text),
+                        )
                         return {
                             "id": f"chatcmpl-zen-resp-{int(time.time())}",
                             "object": "chat.completion",
@@ -1183,6 +1252,7 @@ async def anthropic_messages(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
+    prompt_tokens_estimate = estimate_prompt_tokens(body)
 
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
@@ -1247,7 +1317,12 @@ async def anthropic_messages(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session),
+                    stream_response(
+                        response,
+                        model_name,
+                        session=session,
+                        prompt_tokens_estimate=prompt_tokens_estimate,
+                    ),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -1255,15 +1330,19 @@ async def anthropic_messages(raw_request: Request):
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
-                        usage = res_json.get("usage", {})
+                        usage = res_json.get("usage") or {}
                         track_token_usage(
                             model_name,
-                            prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+                            prompt_tokens=usage.get("input_tokens") or prompt_tokens_estimate,
+                            completion_tokens=usage.get("output_tokens") or estimate_completion_tokens(res_json),
                         )
                         return JSONResponse(content=res_json)
                     except Exception:
-                        track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
+                        track_token_usage(
+                            model_name,
+                            prompt_tokens=prompt_tokens_estimate,
+                            completion_tokens=estimate_text_tokens(response.text),
+                        )
                         return JSONResponse(content=response.text)
 
         except Exception as e:
@@ -1294,6 +1373,7 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+    prompt_tokens_estimate = estimate_prompt_tokens(body)
 
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
@@ -1349,7 +1429,12 @@ async def responses_endpoint(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session),
+                    stream_response(
+                        response,
+                        model_name,
+                        session=session,
+                        prompt_tokens_estimate=prompt_tokens_estimate,
+                    ),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -1357,8 +1442,19 @@ async def responses_endpoint(raw_request: Request):
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
+                        usage = res_json.get("usage") or {}
+                        track_token_usage(
+                            model_name,
+                            prompt_tokens=usage.get("input_tokens") or prompt_tokens_estimate,
+                            completion_tokens=usage.get("output_tokens") or estimate_completion_tokens(res_json),
+                        )
                         return JSONResponse(content=res_json)
                     except Exception:
+                        track_token_usage(
+                            model_name,
+                            prompt_tokens=prompt_tokens_estimate,
+                            completion_tokens=estimate_text_tokens(response.text),
+                        )
                         return JSONResponse(content=response.text)
 
         except Exception as e:

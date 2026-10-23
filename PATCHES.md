@@ -65,6 +65,23 @@ Keep these when updating, otherwise the proxy will fail with
    `sync-models.sh` now labels proxied models so they can be told apart from the
    identical built-in `opencode` provider entries in `/models`.
 
+10. **Real token accounting for streams (`token_usage.py`)**
+    Streamed requests recorded `prompt_tokens=100, completion_tokens=150` at
+    response-creation time, so the dashboard showed neither the real input
+    context nor the real completion.
+
+    - The proxy now relies on the upstream `usage` report. OpenCode already
+      sends `stream_options.include_usage`; the proxy adds it when missing.
+      Parsing covers OpenAI chunks, Anthropic `message_start`/`message_delta`,
+      and Responses `response.completed` events.
+    - If a provider omits usage, input tokens are estimated from the entire
+      request payload (system prompt, messages, tools, instructions) and output
+      tokens from the streamed text, reasoning, and tool-call arguments.
+    - Usage is recorded once when the stream finishes, in the generator's
+      `finally`, so aborted/failed requests are not counted twice.
+    - `MODEL_PRICING_JSON` can override the reference USD-per-1M rates used for
+      the paid-equivalent cost estimate.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.

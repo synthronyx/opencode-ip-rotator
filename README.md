@@ -207,6 +207,7 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `IP_EXHAUSTION_BLOCK_SECONDS` | `86400` | Fallback block duration when upstream sends no reset time |
 | `MAX_EGRESS_ROTATIONS_PER_REQUEST` | `3` | Exhausted IPs one request may rotate away from before returning 429 |
 | `CLIENT_EXHAUSTION_RETRY_AFTER` | `60` | `Retry-After` sent to clients when every IP was exhausted, instead of the dead IP's multi-hour reset |
+| `MODEL_PRICING_JSON` | – | JSON overrides for the USD-per-1M reference rates used in the cost estimate, e.g. `{"glm-5.3-flash-free":{"input_per_1m":0.2,"output_per_1m":0.8}}` |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
@@ -266,10 +267,14 @@ Details in [PATCHES.md](PATCHES.md).
    reused by the rotator; the proxy rotates away and retries on a fresh IP.
 9. **`sync-models.sh`** — keeps the V2 explicit model list in sync with the
    models discovered by the proxy (prefixed `WARP · `).
+10. **Real token accounting** — streaming requests used to record a hardcoded
+    `100`/`150` tokens. The proxy now records the provider's `usage` report
+    (including the whole input context) and falls back to payload/stream
+    estimates, so the dashboard's tokens and cost reflect actual usage.
 
 Files changed vs upstream: `server.py`, `rotator.py`, `rate_limits.py`,
-`ip_blocklist.py` (new), `sync-models.sh` (new), `tests/` (new), plus
-`PATCHES.md` and this README.
+`token_usage.py` (new), `ip_blocklist.py` (new), `sync-models.sh` (new),
+`tests/` (new), plus `PATCHES.md` and this README.
 
 ---
 
@@ -314,6 +319,40 @@ with ip_blocklist._connect() as c:
     c.execute('DELETE FROM blocked_egress_ips WHERE ip = ?', ('104.28.x.x',))
 "
 ```
+
+---
+
+## Token and cost accounting
+
+The dashboard's **Input**, **Output**, and **Total** columns describe the whole
+request, not just the new message:
+
+- **Input** is the full context sent upstream — system prompt, conversation
+  history, tool definitions, and the new user message.
+- **Output** is everything the model generated, including reasoning text and
+  streamed tool-call arguments.
+- **Equivalent OpenCode cost** multiplies those counts by the reference rates in
+  `MODEL_PRICING` (default `$0.20`/`$0.80` per 1M input/output tokens). Free
+  models have no real charge, so this is a paid-equivalent estimate. Override
+  the rates per model with `MODEL_PRICING_JSON` if you want exact figures.
+
+How the numbers are obtained:
+
+1. **Upstream usage first.** OpenCode already sends
+   `stream_options: {"include_usage": true}`; the proxy also adds it when a
+   client omits it. When the provider reports `usage` in the final SSE chunk
+   (OpenAI, Anthropic `message_start`/`message_delta`, or Responses
+   `response.completed`), those exact counts are recorded once per stream.
+2. **Estimates as fallback.** If a provider sends no usage, the proxy estimates
+   input tokens from the complete request payload (`messages`, `system`,
+   `tools`, `input`, `instructions`) and output tokens from the text it
+   actually streamed. Estimates use ~4 ASCII characters per token and ~1 token
+   per non-ASCII character.
+3. **One entry per request.** Usage is recorded when the stream finishes (or
+   when the client disconnects), not when the response headers are created, so
+   aborted and failed streams are not double-counted.
+
+`token_usage.py` holds this logic and is covered by `tests/test_token_usage.py`.
 
 ---
 
