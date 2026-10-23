@@ -26,6 +26,7 @@ from curl_cffi import requests as cffi_requests
 import ip_blocklist
 from rate_limits import classify_upstream_429, is_quota_exhausted
 from token_usage import (
+    compute_cost,
     estimate_completion_tokens,
     estimate_prompt_tokens,
     estimate_text_tokens,
@@ -186,11 +187,17 @@ def init_db():
             requests INTEGER DEFAULT 0,
             prompt_tokens INTEGER DEFAULT 0,
             completion_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0,
             total_tokens INTEGER DEFAULT 0,
             estimated_cost_usd REAL DEFAULT 0.0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Older databases predate prompt-cache accounting.
+    try:
+        _db_execute("ALTER TABLE model_usage ADD COLUMN cached_tokens INTEGER DEFAULT 0")
+    except Exception:
+        pass
     _db_execute("""
         CREATE TABLE IF NOT EXISTS ip_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -270,14 +277,14 @@ def load_metrics_from_db() -> Dict[str, Dict[str, any]]:
         return {}
     try:
         rows = _db_fetchall(
-            "SELECT model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd FROM model_usage"
+            "SELECT model_name, requests, prompt_tokens, completion_tokens, cached_tokens, total_tokens, estimated_cost_usd FROM model_usage"
         )
         stats = {}
         for r in rows:
             stats[r[0]] = {
                 "requests": r[1], "prompt_tokens": r[2],
-                "completion_tokens": r[3], "total_tokens": r[4],
-                "estimated_cost_usd": r[5]
+                "completion_tokens": r[3], "cached_tokens": r[4],
+                "total_tokens": r[5], "estimated_cost_usd": r[6]
             }
         return stats
     except Exception as e:
@@ -397,46 +404,59 @@ try:
                 and "input_per_1m" in _rates
                 and "output_per_1m" in _rates
             ):
-                MODEL_PRICING[_model] = {
+                entry = {
                     "input_per_1m": float(_rates["input_per_1m"]),
                     "output_per_1m": float(_rates["output_per_1m"]),
                 }
+                for optional in ("cache_read_per_1m", "cache_read_ratio"):
+                    if optional in _rates:
+                        entry[optional] = float(_rates[optional])
+                MODEL_PRICING[_model] = entry
 except (TypeError, ValueError) as exc:
     log.warning("Ignoring invalid MODEL_PRICING_JSON: %s", exc)
 
 _model_usage_lock = threading.Lock()
 
-def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
+def track_token_usage(
+    model_name: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cached_tokens: int = 0,
+):
     global model_usage_stats
     pricing = MODEL_PRICING.get(model_name, {"input_per_1m": 0.20, "output_per_1m": 0.80})
-    prompt_cost = (prompt_tokens / 1_000_000) * pricing["input_per_1m"]
-    completion_cost = (completion_tokens / 1_000_000) * pricing["output_per_1m"]
-    cost = prompt_cost + completion_cost
+    cached_tokens = min(max(int(cached_tokens or 0), 0), max(int(prompt_tokens or 0), 0))
+    cost = compute_cost(prompt_tokens, completion_tokens, cached_tokens, pricing)
 
     with _model_usage_lock:
         if model_name not in model_usage_stats:
             model_usage_stats[model_name] = {
                 "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                "total_tokens": 0, "estimated_cost_usd": 0.0
+                "cached_tokens": 0, "total_tokens": 0, "estimated_cost_usd": 0.0
             }
         model_usage_stats[model_name]["requests"] += 1
         model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
+        model_usage_stats[model_name]["cached_tokens"] += cached_tokens
         model_usage_stats[model_name]["completion_tokens"] += completion_tokens
         model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
         model_usage_stats[model_name]["estimated_cost_usd"] += cost
 
     try:
         _db_execute("""
-            INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, cached_tokens, total_tokens, estimated_cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(model_name) DO UPDATE SET
                 requests = requests + excluded.requests,
                 prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                 completion_tokens = completion_tokens + excluded.completion_tokens,
+                cached_tokens = cached_tokens + excluded.cached_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
                 estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                 updated_at = CURRENT_TIMESTAMP
-        """, (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost))
+        """, (
+            model_name, 1, prompt_tokens, completion_tokens, cached_tokens,
+            prompt_tokens + completion_tokens, cost,
+        ))
     except Exception as e:
         log.error(f"Failed to persist metrics to SQLite: {e}")
 
@@ -937,9 +957,10 @@ async def stream_response(
             if recorded_usage:
                 track_token_usage(model_name, *recorded_usage)
                 log.info(
-                    "Token usage for '%s': prompt=%s completion=%s (%s).",
+                    "Token usage for '%s': prompt=%s (cached=%s) completion=%s (%s).",
                     model_name,
                     recorded_usage[0],
+                    recorded_usage[2],
                     recorded_usage[1],
                     "upstream usage" if usage_stats.get("usage") else "estimate",
                 )
@@ -949,6 +970,11 @@ async def stream_response(
                         model_name,
                         prompt_tokens_estimate,
                         recorded_usage[0],
+                    )
+                    log.debug(
+                        "Upstream usage payload for '%s': %s",
+                        model_name,
+                        usage_stats.get("usage"),
                     )
         except Exception as exc:
             log.warning("Failed to record stream token usage for '%s': %s", model_name, exc)

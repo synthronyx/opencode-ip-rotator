@@ -207,7 +207,7 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | `IP_EXHAUSTION_BLOCK_SECONDS` | `86400` | Fallback block duration when upstream sends no reset time |
 | `MAX_EGRESS_ROTATIONS_PER_REQUEST` | `3` | Exhausted IPs one request may rotate away from before returning 429 |
 | `CLIENT_EXHAUSTION_RETRY_AFTER` | `60` | `Retry-After` sent to clients when every IP was exhausted, instead of the dead IP's multi-hour reset |
-| `MODEL_PRICING_JSON` | – | JSON overrides for the USD-per-1M reference rates used in the cost estimate, e.g. `{"glm-5.3-flash-free":{"input_per_1m":0.2,"output_per_1m":0.8}}` |
+| `MODEL_PRICING_JSON` | – | JSON overrides for the USD-per-1M reference rates used in the cost estimate, e.g. `{"glm-5.3-flash-free":{"input_per_1m":0.2,"output_per_1m":0.8,"cache_read_per_1m":0.02}}` |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before environment recycle |
 | `PROXY_LIST` / `data/proxies.txt` | – | Extra round-robin upstream proxies |
 
@@ -335,6 +335,11 @@ request, not just the new message:
   `MODEL_PRICING` (default `$0.20`/`$0.80` per 1M input/output tokens). Free
   models have no real charge, so this is a paid-equivalent estimate. Override
   the rates per model with `MODEL_PRICING_JSON` if you want exact figures.
+- **Cached input is discounted.** Prompt-cache reads (`cached_tokens`,
+  Anthropic `cache_read_input_tokens`, DeepSeek cache hits) are billed at 10% of
+  the input rate by default instead of the full rate. Set
+  `cache_read_per_1m` per model, or `cache_read_ratio`, to change that. The
+  **Cached In** column shows how much of the prompt came from cache.
 
 How the numbers are obtained:
 

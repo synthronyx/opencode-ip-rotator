@@ -79,6 +79,10 @@ Keep these when updating, otherwise the proxy will fail with
       tokens from the streamed text, reasoning, and tool-call arguments.
     - Usage is recorded once when the stream finishes, in the generator's
       `finally`, so aborted/failed requests are not counted twice.
+    - Prompt-cache reads are tracked separately and billed at 10% of the input
+      rate by default (`cache_read_per_1m` / `cache_read_ratio` override), using
+      `prompt_tokens_details.cached_tokens`, Anthropic
+      `cache_read_input_tokens`, or DeepSeek cache-hit counters.
     - `MODEL_PRICING_JSON` can override the reference USD-per-1M rates used for
       the paid-equivalent cost estimate.
 

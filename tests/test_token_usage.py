@@ -179,7 +179,7 @@ class FinalizeUsageTests(unittest.TestCase):
         stats["ascii_chars"] = 10_000
         self.assertEqual(
             token_usage.finalize_usage(stats, prompt_tokens_estimate=7),
-            (4321, 88),
+            (4321, 88, 0),
         )
 
     def test_prefers_anthropic_usage_fields(self):
@@ -187,13 +187,13 @@ class FinalizeUsageTests(unittest.TestCase):
         stats["usage"] = {"input_tokens": 2500, "output_tokens": 75}
         self.assertEqual(
             token_usage.finalize_usage(stats, prompt_tokens_estimate=10),
-            (2500, 75),
+            (2500, 75, 0),
         )
 
     def test_falls_back_to_estimates(self):
         stats = token_usage.new_stream_stats()
         stats["ascii_chars"] = 4000
-        prompt, completion = token_usage.finalize_usage(stats, prompt_tokens_estimate=1234)
+        prompt, completion, _ = token_usage.finalize_usage(stats, prompt_tokens_estimate=1234)
         self.assertEqual(prompt, 1234)
         self.assertGreater(completion, 0)
 
@@ -201,12 +201,117 @@ class FinalizeUsageTests(unittest.TestCase):
         stats = token_usage.new_stream_stats()
         stats["ascii_chars"] = 800
         stats["non_ascii_chars"] = 20
-        _, completion = token_usage.finalize_usage(stats, prompt_tokens_estimate=100)
+        _, completion, _ = token_usage.finalize_usage(stats, prompt_tokens_estimate=100)
         self.assertEqual(completion, 220)
 
     def test_skips_empty_stream(self):
         stats = token_usage.new_stream_stats()
         self.assertIsNone(token_usage.finalize_usage(stats, prompt_tokens_estimate=0))
+
+
+class UsageExtractionTests(unittest.TestCase):
+    def test_openai_prompt_tokens_with_cached_details(self):
+        usage = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 800},
+        }
+        self.assertEqual(
+            token_usage.extract_usage_tokens(usage), (1000, 50, 800)
+        )
+
+    def test_anthropic_input_plus_cache_counters(self):
+        usage = {
+            "input_tokens": 200,
+            "output_tokens": 30,
+            "cache_read_input_tokens": 700,
+            "cache_creation_input_tokens": 100,
+        }
+        self.assertEqual(
+            token_usage.extract_usage_tokens(usage), (1000, 30, 700)
+        )
+
+    def test_deepseek_cache_hit_tokens(self):
+        usage = {
+            "prompt_tokens": 900,
+            "completion_tokens": 40,
+            "prompt_cache_hit_tokens": 600,
+            "prompt_cache_miss_tokens": 300,
+        }
+        self.assertEqual(
+            token_usage.extract_usage_tokens(usage), (900, 40, 600)
+        )
+
+    def test_responses_input_tokens_details(self):
+        usage = {
+            "input_tokens": 750,
+            "output_tokens": 25,
+            "input_tokens_details": {"cached_tokens": 500},
+        }
+        self.assertEqual(
+            token_usage.extract_usage_tokens(usage), (750, 25, 500)
+        )
+
+    def test_finalize_reports_cached_tokens(self):
+        stats = token_usage.new_stream_stats()
+        stats["usage"] = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 900},
+        }
+        self.assertEqual(
+            token_usage.finalize_usage(stats, prompt_tokens_estimate=123),
+            (1000, 10, 900),
+        )
+
+    def test_cached_tokens_clamped_to_prompt(self):
+        stats = token_usage.new_stream_stats()
+        stats["usage"] = {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 5000},
+        }
+        self.assertEqual(
+            token_usage.finalize_usage(stats, prompt_tokens_estimate=0),
+            (100, 5, 100),
+        )
+
+
+class CostTests(unittest.TestCase):
+    pricing = {"input_per_1m": 1.0, "output_per_1m": 2.0}
+
+    def test_no_cache_full_price(self):
+        self.assertAlmostEqual(
+            token_usage.compute_cost(1_000_000, 1_000_000, 0, self.pricing),
+            3.0,
+        )
+
+    def test_cache_read_gets_default_ten_percent_rate(self):
+        # 1M prompt, all cached: $0.10; 1M output: $2.00.
+        self.assertAlmostEqual(
+            token_usage.compute_cost(1_000_000, 1_000_000, 1_000_000, self.pricing),
+            2.10,
+        )
+
+    def test_partial_cache_split(self):
+        # 500k full-price + 500k at 10% = 0.55; output 0.20.
+        self.assertAlmostEqual(
+            token_usage.compute_cost(1_000_000, 100_000, 500_000, self.pricing),
+            0.75,
+        )
+
+    def test_explicit_cache_rate(self):
+        pricing = {"input_per_1m": 1.0, "output_per_1m": 2.0, "cache_read_per_1m": 0.25}
+        self.assertAlmostEqual(
+            token_usage.compute_cost(1_000_000, 0, 1_000_000, pricing),
+            0.25,
+        )
+
+    def test_cached_cannot_exceed_prompt(self):
+        self.assertAlmostEqual(
+            token_usage.compute_cost(100, 0, 5000, self.pricing),
+            0.00001,
+        )
 
 
 if __name__ == "__main__":
