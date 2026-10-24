@@ -21,7 +21,9 @@ import ip_blocklist
 # -----------------------------------------------------------------------------
 CHECK_ENDPOINT = os.environ.get("WARP_CHECK_ENDPOINT", "https://opencode.ai")
 CHECK_INTERVAL = int(os.environ.get("WARP_CHECK_INTERVAL", "15"))
-PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "300"))
+# 0 disables scheduled rotation: the egress IP stays pinned until the upstream
+# reports that its quota is exhausted.
+PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "0"))
 
 INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
@@ -167,35 +169,63 @@ def get_public_ip(ip_version: Optional[int] = None) -> Optional[str]:
 _upstream_ip_version: Optional[int] = None
 
 
-def detect_upstream_ip_version() -> int:
-    """Return the address family the upstream connection actually uses.
+def get_upstream_egress_ip(timeout: int = 8) -> Optional[str]:
+    """Return the public IP **as seen by the upstream host**.
 
-    WARP's IPv4 egress can be sticky for a colo while IPv6 changes on every
-    registration.  Blocking/verifying the wrong family makes rotations fail
-    even though the address the upstream sees did change.
+    ``response.local_ip`` is the WARP tunnel address (e.g. ``172.16.0.2``), not
+    the public egress address, so it cannot be used to key the quota blocklist.
+    Cloudflare's ``/cdn-cgi/trace`` on the upstream host reports the address
+    that actually reaches the API, which is also the address the quota is
+    attached to.
     """
-    global _upstream_ip_version
-    if _upstream_ip_version in (4, 6):
-        return _upstream_ip_version
     try:
         from curl_cffi import requests
-        resp = requests.get(
-            "https://opencode.ai/", impersonate="chrome124", timeout=10
+
+        response = requests.get(
+            "https://opencode.ai/cdn-cgi/trace",
+            impersonate="chrome124",
+            timeout=timeout,
         )
-        local_ip = getattr(resp, "local_ip", "") or ""
-        if local_ip:
-            version = 6 if ":" in local_ip else 4
-            # Only cache IPv6. Right after WARP connects, IPv6 may not be up
-            # yet and a single probe reports IPv4; caching that would make
-            # later rotations verify the sticky IPv4 address forever.
-            if version == 6:
-                _upstream_ip_version = 6
-            log.info("Upstream egress family detected: IPv%s", version)
-            return version
+        if response.status_code == 200:
+            for line in response.text.splitlines():
+                if line.startswith("ip="):
+                    ip = line[3:].strip()
+                    if ip:
+                        return ip
     except Exception:
         pass
-    # Do not cache a guess: a transient probe failure must not pin us to the
-    # wrong family for the lifetime of the process.
+
+    # curl_cffi occasionally times out on this lightweight endpoint even while
+    # the tunnel is healthy; the plain client still uses the WARP route because
+    # the proxy shares this network namespace.
+    try:
+        request = Request(
+            "https://opencode.ai/cdn-cgi/trace",
+            headers={"User-Agent": "curl/8.0"},
+        )
+        with urlopen(request, timeout=timeout) as response:
+            if response.status == 200:
+                for line in response.read().decode("utf-8", errors="ignore").splitlines():
+                    if line.startswith("ip="):
+                        ip = line[3:].strip()
+                        if ip:
+                            return ip
+    except Exception:
+        pass
+    return None
+
+
+def detect_upstream_ip_version() -> int:
+    """Return the address family the upstream connection actually uses."""
+    global _upstream_ip_version
+    egress_ip = get_upstream_egress_ip()
+    if egress_ip:
+        version = 6 if ":" in egress_ip else 4
+        _upstream_ip_version = version
+        log.info("Upstream egress family detected: IPv%s", version)
+        return version
+    if _upstream_ip_version in (4, 6):
+        return _upstream_ip_version
     return 4
 
 
@@ -282,10 +312,38 @@ def rotate_warp(
     reason: str = "Triggered",
     force: bool = False,
     ip_version: Optional[int] = None,
+    expected_ip: Optional[str] = None,
+    only_if_blocked: bool = False,
 ) -> bool:
     global _current_ip, rotation_count
     with rotation_lock:
         with flow_lock:
+            if ip_version not in (4, 6):
+                ip_version = detect_upstream_ip_version()
+
+            trace_ip = get_upstream_egress_ip()
+            live_ip = trace_ip or get_public_ip(ip_version) or _current_ip
+
+            # Atomicity: another session may have rotated while this request was
+            # queued for the lock. If the egress already changed, report success
+            # so the caller retries on the fresh IP instead of burning another.
+            # Only trust the trace address here: a fallback probe can report a
+            # different WARP address and would cause a false "already rotated".
+            if expected_ip and trace_ip and trace_ip != expected_ip:
+                log.info(
+                    "Rotation already handled by another request (%s -> %s); skipping duplicate rotation.",
+                    expected_ip,
+                    trace_ip,
+                )
+                _current_ip = live_ip
+                return True
+
+            # Never rotate a healthy IP just because a timer fired.
+            if only_if_blocked and trace_ip and not ip_blocklist.is_blocked(trace_ip):
+                log.info("Rotation skipped: egress IP %s still has quota.", trace_ip)
+                _current_ip = live_ip
+                return True
+
             if active_flows_count > 0 or has_active_flow_leases():
                 if not force:
                     log.info("IP rotation skipped — an active streaming flow lease is in progress.")
@@ -295,9 +353,7 @@ def rotate_warp(
                     reason,
                 )
 
-            if ip_version not in (4, 6):
-                ip_version = detect_upstream_ip_version()
-            old_ip = get_public_ip(ip_version) or _current_ip
+            old_ip = live_ip
             log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IPv{ip_version}: {old_ip})")
 
             # Try local WARP CLI rotation first
@@ -319,7 +375,7 @@ def rotate_warp(
 
                         if res.returncode == 0:
                             time.sleep(3)
-                            new_ip = get_public_ip(ip_version)
+                            new_ip = get_upstream_egress_ip() or get_public_ip(ip_version)
 
                             if (
                                 new_ip
@@ -443,12 +499,6 @@ def trigger_container_recycle():
     except Exception as e:
         log.error(f"Failed to trigger auto-recycle: {e}")
 
-def handle_rate_limit(attempt: int, initial_delay: int, max_retries: int) -> bool:
-    delay = initial_delay * (2 ** (attempt - 1))
-    log.warning(f"HTTP 429 Rate Limit detected! Retry attempt {attempt}/{max_retries} — Backoff delay: {delay}s")
-    time.sleep(delay)
-    return rotate_warp(reason=f"HTTP 429 - Attempt {attempt}")
-
 # -----------------------------------------------------------------------------
 # Background Monitors
 # -----------------------------------------------------------------------------
@@ -465,11 +515,17 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
         except HTTPError as e:
             if e.code == 429:
                 retry_count += 1
-                if retry_count <= max_retries:
-                    handle_rate_limit(retry_count, initial_delay, max_retries)
-                else:
-                    log.error(f"Maximum retry attempts ({max_retries}) reached. Pausing health check for 30s.")
-                    time.sleep(30)
+                # The probe hits a public web page, not the model API. A 429
+                # here says nothing about egress quota, so never rotate for it.
+                delay = min(initial_delay * (2 ** (retry_count - 1)), 30)
+                log.warning(
+                    "Health check endpoint rate-limited (attempt %s/%s); backing off %ss without rotating.",
+                    retry_count,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                if retry_count > max_retries:
                     retry_count = 0
         except Exception as e:
             log.debug(f"Health check error: {e}")
@@ -479,30 +535,30 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
 def periodic_rotation_loop(interval: int, stop_event: threading.Event) -> None:
     global _current_ip
     if interval <= 0:
+        log.info("Scheduled IP rotation disabled (WARP_ROTATION_INTERVAL=0); pinning until quota exhaustion.")
         return
 
-    log.info(f"Periodic IP rotator started. (Interval: {interval}s)")
+    log.info(f"Blocklist reconciliation loop started. (Check interval: {interval}s; rotates only exhausted IPs)")
     while not stop_event.is_set():
         if stop_event.wait(interval):
             break
         ip_version = detect_upstream_ip_version()
-        live_ip = get_public_ip(ip_version)
+        live_ip = get_upstream_egress_ip() or get_public_ip(ip_version)
         if live_ip:
             _current_ip = live_ip
-        blocked = ip_blocklist.is_blocked(_current_ip)
-        if blocked:
-            # An exhausted IP cannot serve new requests; do not let a stale
-            # stream lease pin us to it.
-            log.warning(
-                "Current egress IP %s is blocklisted; forcing scheduled rotation.",
-                _current_ip,
-            )
-            rotate_warp(reason="Scheduled Interval (blocked IP)", force=True)
+        if not live_ip or not ip_blocklist.is_blocked(live_ip):
             continue
-        if has_active_flow_leases():
-            log.info("Scheduled IP rotation deferred — an active streaming flow lease is in progress.")
-            continue
-        rotate_warp(reason="Scheduled Interval")
+        log.warning(
+            "Current egress IP %s is blocklisted; forcing rotation.",
+            live_ip,
+        )
+        rotate_warp(
+            reason="Egress IP exhausted",
+            force=True,
+            ip_version=ip_version,
+            expected_ip=live_ip,
+            only_if_blocked=True,
+        )
 
 def start_rotator_http_server():
     """Starts a lightweight HTTP server inside warp-rotator container on port 8001 to handle remote rotate requests."""
@@ -517,11 +573,18 @@ def start_rotator_http_server():
             return {"status": "healthy", "current_ip": _current_ip, "rotations": rotation_count}
 
         @rotator_app.post("/rotate")
-        def http_rotate(force: bool = False, family: Optional[int] = None):
+        def http_rotate(
+            force: bool = False,
+            family: Optional[int] = None,
+            expected_ip: Optional[str] = None,
+            only_if_blocked: bool = False,
+        ):
             success = rotate_warp(
                 reason="Remote HTTP Dashboard Trigger",
                 force=force,
                 ip_version=family,
+                expected_ip=expected_ip,
+                only_if_blocked=only_if_blocked,
             )
             return {"status": "success" if success else "failed", "verified_ip": _current_ip}
         
@@ -563,7 +626,7 @@ def main() -> None:
         if ip_version == 6:
             break
         time.sleep(5)
-    _current_ip = get_public_ip(ip_version)
+    _current_ip = get_upstream_egress_ip() or get_public_ip(ip_version)
     log.info(f"Starting IP Rotator Node... Initial Verified Public IPv{ip_version}: {_current_ip}")
 
     blocked_until = ip_blocklist.blocked_until(_current_ip)
@@ -573,7 +636,13 @@ def main() -> None:
             _current_ip,
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until)),
         )
-        rotate_warp("startup IP is blocklisted")
+        rotate_warp(
+            "startup IP is blocklisted",
+            force=True,
+            ip_version=ip_version,
+            expected_ip=_current_ip,
+            only_if_blocked=True,
+        )
 
     stop_event = threading.Event()
 

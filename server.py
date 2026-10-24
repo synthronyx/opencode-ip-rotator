@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request as UrlRequest, urlopen
 
 import uvicorn
@@ -40,6 +41,7 @@ from rotator import (
     flow_lock,
     active_flows_count,
     get_public_ip,
+    get_upstream_egress_ip,
     get_ip_location,
     rotation_count,
     detect_upstream_ip_version,
@@ -240,9 +242,30 @@ def init_db():
 
 
 def acquire_flow_lease() -> str:
+    prune_expired_flow_leases()
     lease_id = uuid.uuid4().hex
     touch_flow_lease(lease_id)
     return lease_id
+
+
+_last_lease_prune = 0.0
+
+
+def prune_expired_flow_leases(force: bool = False) -> None:
+    """Delete leases whose stream has certainly ended.
+
+    The rotator only prunes when it considers rotating; with scheduled rotation
+    disabled this table would otherwise grow without bound.
+    """
+    global _last_lease_prune
+    now = time.time()
+    if not force and now - _last_lease_prune < 60:
+        return
+    _last_lease_prune = now
+    try:
+        _db_execute("DELETE FROM active_flow_leases WHERE expires_at <= ?", (now,))
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("Failed to prune expired flow leases: %s", exc)
 
 
 def touch_flow_lease(lease_id: str) -> None:
@@ -532,6 +555,11 @@ MAX_EGRESS_ROTATIONS_PER_REQUEST = int(os.environ.get("MAX_EGRESS_ROTATIONS_PER_
 CLIENT_EXHAUSTION_RETRY_AFTER = int(os.environ.get("CLIENT_EXHAUSTION_RETRY_AFTER", "60"))
 # Serialise exhaustion handling so two concurrent 429s do not rotate twice.
 _egress_rotation_lock = asyncio.Lock()
+# A successful rotation should serve the waiting sessions before another one is
+# allowed. This prevents concurrent 429s from hopping through the whole WARP
+# pool in a few seconds.
+_last_rotation_at = 0.0
+MIN_ROTATION_INTERVAL_SECONDS = int(os.environ.get("MIN_ROTATION_INTERVAL_SECONDS", "10"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 CORS_ALLOW_ORIGINS = [
@@ -581,6 +609,7 @@ log = logging.getLogger("zen_server")
 async def lifespan(application: FastAPI):
     global model_usage_stats
     init_db()
+    prune_expired_flow_leases(force=True)
     model_usage_stats = load_metrics_from_db()
     _discovery_stop.clear()
     threading.Thread(target=discover_models_task, daemon=True).start()
@@ -843,21 +872,26 @@ async def rotate_away_from_exhausted_ip(
     if not exhausted:
         return False
 
-    # The address family upstream actually used (response.local_ip) is the one
-    # whose quota matters. WARP's IPv4 egress can be sticky while IPv6 rotates.
+    # ``response.local_ip`` is the WARP tunnel address (e.g. 172.16.0.2), not
+    # the public egress address. Ask the upstream host which address it sees:
+    # that is the one the quota is attached to and therefore the one to block.
     local_ip = getattr(response, "local_ip", "") or ""
-    ip_version = 6 if ":" in local_ip else 4 if local_ip else None
-    if ip_version is None:
-        ip_version = await asyncio.to_thread(detect_upstream_ip_version)
-
-    egress_ip = await asyncio.to_thread(get_public_ip, ip_version)
+    egress_ip = await asyncio.to_thread(get_upstream_egress_ip)
+    if not egress_ip and local_ip and ":" in local_ip and not local_ip.startswith(
+        ("10.", "172.", "192.168.")
+    ):
+        egress_ip = local_ip
     if not egress_ip:
-        log.warning(
-            "Quota exhausted for '%s', but the current IPv%s egress IP could not be identified.",
-            model_name,
-            ip_version,
-        )
-        return False
+        ip_version = await asyncio.to_thread(detect_upstream_ip_version)
+        egress_ip = await asyncio.to_thread(get_public_ip, ip_version)
+        if not egress_ip:
+            log.warning(
+                "Quota exhausted for '%s', but the current egress IP could not be identified.",
+                model_name,
+            )
+            return False
+    else:
+        ip_version = 6 if ":" in egress_ip else 4
 
     expiry = await asyncio.to_thread(
         ip_blocklist.block_ip,
@@ -876,9 +910,11 @@ async def rotate_away_from_exhausted_ip(
     )
 
     async with _egress_rotation_lock:
-        # Another request may have rotated while we waited for the lock.  If so,
+        # Another request may have rotated while we waited for the lock. If so,
         # retry on that fresh IP instead of burning another one.
-        active_ip = await asyncio.to_thread(get_public_ip, ip_version)
+        active_ip = await asyncio.to_thread(get_upstream_egress_ip)
+        if not active_ip:
+            active_ip = await asyncio.to_thread(get_public_ip, ip_version)
         if active_ip and active_ip != egress_ip and not ip_blocklist.is_blocked(active_ip):
             log.info(
                 "Egress already rotated %s -> %s by another request; retrying on it.",
@@ -887,9 +923,25 @@ async def rotate_away_from_exhausted_ip(
             )
             return True
 
+        # Coalesce a burst of concurrent 429s: the session that won the lock has
+        # just rotated, so let the fresh IP serve a few requests before another
+        # rotation is allowed.
+        global _last_rotation_at
+        if time.monotonic() - _last_rotation_at < MIN_ROTATION_INTERVAL_SECONDS:
+            log.info(
+                "Rotation completed less than %ss ago; not rotating again yet.",
+                MIN_ROTATION_INTERVAL_SECONDS,
+            )
+            return False
+
         rotated, new_ip = await asyncio.to_thread(
-            rotate_egress, f"exhausted egress IP {egress_ip}", True, ip_version
+            rotate_egress,
+            f"exhausted egress IP {egress_ip}",
+            True,
+            ip_version,
+            egress_ip,
         )
+        _last_rotation_at = time.monotonic()
         if not rotated:
             log.warning(
                 "Egress rotation failed; %s is still the active IP and stays blocked.",
@@ -918,9 +970,17 @@ async def rotate_away_from_exhausted_ip(
 
 
 def rotate_egress(
-    reason: str, force: bool = False, ip_version: Optional[int] = None
+    reason: str,
+    force: bool = False,
+    ip_version: Optional[int] = None,
+    expected_ip: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Request rotation from the service that owns the shared WARP namespace."""
+    """Request rotation from the service that owns the shared WARP namespace.
+
+    ``expected_ip`` makes the rotation idempotent: if another session already
+    moved the egress away from that address, the rotator reports success
+    without burning another registration.
+    """
     params = []
     if force:
         # An exhausted IP cannot serve traffic; a stale stream lease must not
@@ -928,6 +988,8 @@ def rotate_egress(
         params.append("force=true")
     if ip_version in (4, 6):
         params.append(f"family={ip_version}")
+    if expected_ip:
+        params.append(f"expected_ip={quote(expected_ip, safe='')}")
     url = f"{WARP_ROTATOR_URL}/rotate"
     if params:
         url += "?" + "&".join(params)

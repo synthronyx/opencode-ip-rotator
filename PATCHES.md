@@ -46,10 +46,9 @@ Keep these when updating, otherwise the proxy will fail with
 
    - `blocked_egress_ips` in the shared `metrics.db` records each exhausted IP
      until the upstream reset time (`Retry-After`), or 24h when absent.
-   - The blocked address is the family the upstream actually used
-     (`response.local_ip`), not whichever address an IP-echo service happens to
-     return. WARP can keep a sticky IPv4 while rotating IPv6, which previously
-     made successful rotations look "identical".
+   - The blocked address is the public IP the upstream actually sees. This was
+     initially derived from `response.local_ip`; see item 12 for why that was
+     wrong and how the Cloudflare trace endpoint replaced it.
    - The proxy checks the 429 class: a quota error or
      `Retry-After >= IP_EXHAUSTION_RETRY_AFTER` (default 300s) marks the current
      egress IP, rotates, and retries the request on the fresh IP. Short
@@ -58,7 +57,7 @@ Keep these when updating, otherwise the proxy will fail with
      the proxy to an address that cannot serve new requests.
    - `rotator.py` refuses to accept a blocklisted IP during rotation (tries
      another registration) and rotates away from a blocklisted address at
-     startup. Periodic rotation also forces when the current IP is blocked.
+     startup. Scheduled rotation is disabled by default; see item 12.
    - `/metrics` and the dashboard expose the active blocklist.
 
 9. **Model names prefixed with `WARP · `**
@@ -104,6 +103,34 @@ Keep these when updating, otherwise the proxy will fail with
       `X-Session-Id`. Optional `STANDALONE_API_KEY` protects every `/v1/*`
       endpoint.
 
+12. **Pin-until-exhausted, atomic rotation**
+    Scheduled rotation every 300s rotated healthy IPs and could collide with
+    request-driven rotation (multiple separate `warp-cli` registrations while
+    chats were in flight).
+
+    - `WARP_ROTATION_INTERVAL` now defaults to `0`. The egress IP is pinned until
+      the upstream reports quota exhaustion. A positive value only re-checks the
+      blocklist and rotates an already-exhausted IP.
+    - The "current egress IP" is read from
+      `https://opencode.ai/cdn-cgi/trace` (`ip=...`). `response.local_ip` is the
+      WARP tunnel address (`172.16.0.2`), not the public IP, so keying the
+      blocklist on it blocked the wrong address and made every rotation appear
+      to land on an exhausted IP.
+    - `rotate_warp()` accepts `expected_ip` / `only_if_blocked`; the HTTP
+      `/rotate` endpoint forwards them. If another session already moved the
+      egress, the queued rotation is skipped instead of burning another
+      registration.
+    - The proxy serialises exhaustion handling with a lock, re-checks the trace
+      IP after acquiring it, and applies `MIN_ROTATION_INTERVAL_SECONDS`
+      (default 10s) so concurrent sessions cannot trigger a rotation storm.
+    - Health-check 429s no longer rotate (the probe is a public page, not the
+      model API).
+    - Expired `active_flow_leases` are pruned on startup and periodically, so
+      the leaked lease table cannot block rotation after scheduled rotation is
+      disabled.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.
+
+
