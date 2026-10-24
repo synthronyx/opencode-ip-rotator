@@ -266,6 +266,7 @@ Tuning (edit `docker-compose.yml`, then `docker compose up -d`):
 | --- | --- | --- |
 | `WARP_ROTATION_INTERVAL` | `0` | `0` pins the egress IP until its upstream quota is exhausted. A positive value only re-checks the blocklist on that interval (it never rotates a healthy IP). |
 | `MIN_ROTATION_INTERVAL_SECONDS` | `10` | Cooldown after a rotation; concurrent sessions cannot trigger a rotation storm |
+| `GLOBAL_EXHAUSTION_IDENTITIES` | `3` | Distinct quota identities that must fail before the proxy concludes the limit is not IP-scoped and stops rotating |
 | `WARP_CHECK_INTERVAL` | `15` | WARP health check interval |
 | `OPENCODE_ZEN_PORT` | `8000` | Proxy port |
 | `UPSTREAM_STREAM_TIMEOUT` | `150` | Seconds without upstream bytes before the proxy aborts and retries |
@@ -363,27 +364,39 @@ This fork keeps those addresses in a shared SQLite table
   startup, trying another registration instead;
 - transient limits (short `Retry-After`, e.g. 30–60s) are **not** blocked.
 
-The blocklist records the public IP **as seen by the upstream host**, read from
-`https://opencode.ai/cdn-cgi/trace` (`ip=...`, `warp=on`). `response.local_ip`
-is only the WARP tunnel address (`172.16.0.2`), so it must not be used for
-blocklisting or family detection — doing so blocked a different address than
-the one whose quota was actually spent and caused endless rotations.
+The blocklist records the upstream **quota identity**, read from
+`https://opencode.ai/cdn-cgi/trace` (`ip=...`, `warp=on`):
+
+- for IPv6 it stores only the first four hextets (the `/64` prefix), because
+  OpenCode's `ipRateLimiter` collapses IPv6 addresses to that prefix before it
+  builds the Redis counter key;
+- for IPv4 it stores the full address.
+
+`response.local_ip` is only the WARP tunnel address (`172.16.0.2`), so it is
+never used. Blocking a full IPv6 address while the upstream buckets by `/64`
+previously made every sibling address look fresh, which is why the blocklist
+kept growing without restoring access.
 
 Rotation is pinned and atomic:
 
 - the egress IP is kept until the upstream reports quota exhaustion; there is no
   scheduled rotation (`WARP_ROTATION_INTERVAL=0`);
 - when several sessions hit the exhausted IP together, only one rotates. The
-  others wait on a shared lock, then re-check the trace IP and retry on the
+  others wait on a shared lock, then re-check the trace identity and retry on the
   fresh address instead of rotating again;
 - the rotator also receives `expected_ip` and skips the rotation if that
-  address is already gone, so a queued rotation cannot bounce twice;
-- a short cooldown (`MIN_ROTATION_INTERVAL_SECONDS`) coalesces bursts, so
-  concurrent 429s cannot hop through the whole WARP pool in seconds;
-- rotation on exhaustion is **forced**: a stale stream lease cannot pin the
-  proxy to a dead address; and
-- health-check 429s (the probe hits `opencode.ai`, not the model API) never
-  rotate.
+  identity is already gone, so a queued rotation cannot bounce twice;
+- a rotation only counts as successful when it changes the **quota identity**;
+  landing on another address in the same `/64` is retried;
+- a short cooldown (`MIN_ROTATION_INTERVAL_SECONDS`) coalesces bursts; and
+- if `GLOBAL_EXHAUSTION_IDENTITIES` (default 3) *different* identities all
+  report exhaustion, the proxy concludes the free-tier limit is no longer
+  IP-scoped (which is what the upstream does today) and stops rotating and
+  extending the blocklist until the reported reset time. Requests get a prompt
+  `429` meanwhile instead of burning registrations every few seconds.
+
+Health-check 429s (the probe hits `opencode.ai`, not the model API) never
+rotate.
 
 Inspect the blocklist:
 

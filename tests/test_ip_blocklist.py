@@ -48,6 +48,48 @@ class EgressBlocklistTests(unittest.TestCase):
         self.assertFalse(ip_blocklist.is_blocked(None))
         self.assertIsNone(ip_blocklist.blocked_until(""))
 
+    def test_ipv6_uses_upstream_64_prefix(self):
+        self.assertEqual(
+            ip_blocklist.quota_identity("2a09:bac5:3f10:a82::10c:72"),
+            "2a09:bac5:3f10:a82",
+        )
+        self.assertEqual(
+            ip_blocklist.quota_identity("203.0.113.5"), "203.0.113.5"
+        )
+
+    def test_blocking_one_ipv6_address_blocks_its_64(self):
+        ip_blocklist.block_ip("2a09:bac5:3f10:a82::10c:72", time.time() + 3600)
+        self.assertTrue(
+            ip_blocklist.is_blocked("2a09:bac5:3f10:a82::10c:76")
+        )
+        self.assertFalse(
+            ip_blocklist.is_blocked("2a09:bac5:3f11:a82::10c:76")
+        )
+        self.assertEqual(
+            [entry["ip"] for entry in ip_blocklist.list_blocked()],
+            ["2a09:bac5:3f10:a82"],
+        )
+
+    def test_init_db_migrates_full_ipv6_rows(self):
+        with ip_blocklist._connect() as conn:
+            conn.execute(
+                "INSERT INTO blocked_egress_ips (ip, blocked_until, reason, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "2a09:bac1:36c0:5f70::2a6:55",
+                    time.time() + 3600,
+                    "quota",
+                    time.time(),
+                ),
+            )
+        ip_blocklist.init_db()
+        self.assertTrue(
+            ip_blocklist.is_blocked("2a09:bac1:36c0:5f70::2a8:16")
+        )
+        self.assertEqual(
+            [entry["ip"] for entry in ip_blocklist.list_blocked()],
+            ["2a09:bac1:36c0:5f70"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

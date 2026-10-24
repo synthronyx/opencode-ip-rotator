@@ -560,6 +560,12 @@ _egress_rotation_lock = asyncio.Lock()
 # pool in a few seconds.
 _last_rotation_at = 0.0
 MIN_ROTATION_INTERVAL_SECONDS = int(os.environ.get("MIN_ROTATION_INTERVAL_SECONDS", "10"))
+# If this many *distinct* quota identities (/64 for IPv6, full IPv4) are all
+# rejected, the upstream limit is not IP-scoped. Rotating further only burns
+# WARP registrations and grows the blocklist, so pause until the reset.
+GLOBAL_EXHAUSTION_IDENTITIES = int(os.environ.get("GLOBAL_EXHAUSTION_IDENTITIES", "3"))
+_exhausted_identities: set[str] = set()
+_global_exhausted_until = 0.0
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 CORS_ALLOW_ORIGINS = [
@@ -854,6 +860,24 @@ def upstream_rate_limit_response(
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
 
+def note_upstream_success() -> None:
+    """A real success means the quota window is usable again."""
+    global _global_exhausted_until
+    if _exhausted_identities or _global_exhausted_until:
+        log.info("Upstream request succeeded; clearing egress exhaustion state.")
+    _exhausted_identities.clear()
+    _global_exhausted_until = 0.0
+
+
+def global_exhaustion_until() -> float:
+    """Return the epoch until which rotation is known to be futile."""
+    global _global_exhausted_until
+    if _global_exhausted_until and time.time() >= _global_exhausted_until:
+        _global_exhausted_until = 0.0
+        _exhausted_identities.clear()
+    return _global_exhausted_until
+
+
 async def rotate_away_from_exhausted_ip(
     response,
     model_name: str,
@@ -871,7 +895,6 @@ async def rotate_away_from_exhausted_ip(
     )
     if not exhausted:
         return False
-
     # ``response.local_ip`` is the WARP tunnel address (e.g. 172.16.0.2), not
     # the public egress address. Ask the upstream host which address it sees:
     # that is the one the quota is attached to and therefore the one to block.
@@ -893,14 +916,27 @@ async def rotate_away_from_exhausted_ip(
     else:
         ip_version = 6 if ":" in egress_ip else 4
 
+    identity = ip_blocklist.quota_identity(egress_ip) or egress_ip
+
+    active_until = global_exhaustion_until()
+    if active_until:
+        log.info(
+            "Upstream quota is known to be non-IP-scoped (%d identities rejected); "
+            "not rotating again until %s.",
+            len(_exhausted_identities),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(active_until)),
+        )
+        return False
+
     expiry = await asyncio.to_thread(
         ip_blocklist.block_ip,
-        egress_ip,
+        identity,
         (time.time() + retry_seconds) if retry_seconds else None,
-        f"upstream {category} for {model_name}",
+        f"upstream {category} for {model_name} (egress {egress_ip})",
     )
     log.warning(
-        "Egress IP %s has no upstream quota left (%s, retry_after=%ss); blocked until %s.",
+        "Egress quota identity %s (address %s) has no upstream quota left (%s, retry_after=%ss); blocked until %s.",
+        identity,
         egress_ip,
         category,
         retry_seconds,
@@ -909,17 +945,37 @@ async def rotate_away_from_exhausted_ip(
         else "unknown",
     )
 
+    _exhausted_identities.add(identity)
+    if len(_exhausted_identities) >= GLOBAL_EXHAUSTION_IDENTITIES:
+        global _global_exhausted_until
+        reset_at = time.time() + (retry_seconds or ip_blocklist.DEFAULT_BLOCK_SECONDS)
+        _global_exhausted_until = reset_at
+        log.warning(
+            "Upstream rejected %d distinct egress quota identities (%s). The free-tier "
+            "limit is not IP-scoped right now, so further rotation cannot restore quota. "
+            "Pausing rotations until %s.",
+            len(_exhausted_identities),
+            ", ".join(sorted(_exhausted_identities)),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_at)),
+        )
+        return False
+
     async with _egress_rotation_lock:
         # Another request may have rotated while we waited for the lock. If so,
-        # retry on that fresh IP instead of burning another one.
+        # retry on that fresh identity instead of burning another one.
         active_ip = await asyncio.to_thread(get_upstream_egress_ip)
         if not active_ip:
             active_ip = await asyncio.to_thread(get_public_ip, ip_version)
-        if active_ip and active_ip != egress_ip and not ip_blocklist.is_blocked(active_ip):
+        active_identity = ip_blocklist.quota_identity(active_ip)
+        if (
+            active_identity
+            and active_identity != identity
+            and not ip_blocklist.is_blocked(active_identity)
+        ):
             log.info(
                 "Egress already rotated %s -> %s by another request; retrying on it.",
-                egress_ip,
-                active_ip,
+                identity,
+                active_identity,
             )
             return True
 
@@ -936,7 +992,7 @@ async def rotate_away_from_exhausted_ip(
 
         rotated, new_ip = await asyncio.to_thread(
             rotate_egress,
-            f"exhausted egress IP {egress_ip}",
+            f"exhausted egress identity {identity}",
             True,
             ip_version,
             egress_ip,
@@ -944,8 +1000,8 @@ async def rotate_away_from_exhausted_ip(
         _last_rotation_at = time.monotonic()
         if not rotated:
             log.warning(
-                "Egress rotation failed; %s is still the active IP and stays blocked.",
-                egress_ip,
+                "Egress rotation failed; %s is still the active identity and stays blocked.",
+                identity,
             )
             return False
 
@@ -953,17 +1009,25 @@ async def rotate_away_from_exhausted_ip(
             log.warning("Rotation reported success but returned no verified IP; not retrying blindly.")
             return False
 
-        if ip_blocklist.is_blocked(new_ip):
+        new_identity = ip_blocklist.quota_identity(new_ip)
+        if (
+            not new_identity
+            or new_identity == identity
+            or new_identity in _exhausted_identities
+            or ip_blocklist.is_blocked(new_identity)
+        ):
             log.warning(
-                "Rotated onto %s, which is also blocklisted; refusing to reuse it.",
+                "Rotated onto %s (quota identity %s), which is already known exhausted; refusing to reuse it.",
                 new_ip,
+                new_identity,
             )
             return False
 
         log.info(
-            "Egress rotated %s -> %s; retrying '%s' on the fresh IP.",
+            "Egress rotated %s -> %s (quota identity %s); retrying '%s' on the fresh identity.",
             egress_ip,
             new_ip,
+            new_identity,
             model_name,
         )
         return True
@@ -1488,6 +1552,7 @@ async def chat_completions(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            note_upstream_success()
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
@@ -1656,6 +1721,7 @@ async def anthropic_messages(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            note_upstream_success()
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
@@ -1768,6 +1834,7 @@ async def responses_endpoint(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            note_upstream_success()
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)

@@ -338,24 +338,28 @@ def rotate_warp(
 
             trace_ip = get_upstream_egress_ip()
             live_ip = trace_ip or get_public_ip(ip_version) or _current_ip
+            live_key = ip_blocklist.quota_identity(trace_ip) if trace_ip else None
 
             # Atomicity: another session may have rotated while this request was
             # queued for the lock. If the egress already changed, report success
             # so the caller retries on the fresh IP instead of burning another.
             # Only trust the trace address here: a fallback probe can report a
             # different WARP address and would cause a false "already rotated".
-            if expected_ip and trace_ip and trace_ip != expected_ip:
+            # Compare quota identities (/64 for IPv6), because the upstream
+            # counts sibling addresses in the same /64 as one IP.
+            expected_key = ip_blocklist.quota_identity(expected_ip)
+            if expected_key and live_key and live_key != expected_key:
                 log.info(
                     "Rotation already handled by another request (%s -> %s); skipping duplicate rotation.",
-                    expected_ip,
-                    trace_ip,
+                    expected_key,
+                    live_key,
                 )
                 _current_ip = live_ip
                 return True
 
             # Never rotate a healthy IP just because a timer fired.
-            if only_if_blocked and trace_ip and not ip_blocklist.is_blocked(trace_ip):
-                log.info("Rotation skipped: egress IP %s still has quota.", trace_ip)
+            if only_if_blocked and live_key and not ip_blocklist.is_blocked(live_key):
+                log.info("Rotation skipped: egress quota identity %s still has quota.", live_key)
                 _current_ip = live_ip
                 return True
 
@@ -391,11 +395,14 @@ def rotate_warp(
                         if res.returncode == 0:
                             time.sleep(3)
                             new_ip = get_upstream_egress_ip() or get_public_ip(ip_version)
+                            old_key = ip_blocklist.quota_identity(old_ip)
+                            new_key = ip_blocklist.quota_identity(new_ip)
 
                             if (
                                 new_ip
-                                and new_ip != old_ip
-                                and not ip_blocklist.is_blocked(new_ip)
+                                and new_key
+                                and new_key != old_key
+                                and not ip_blocklist.is_blocked(new_key)
                             ):
                                 _current_ip = new_ip
                                 rotation_count += 1
@@ -433,18 +440,25 @@ def rotate_warp(
                                     trigger_container_recycle()
 
                                 return True
-                            elif new_ip and new_ip != old_ip:
-                                blocked_until = ip_blocklist.blocked_until(new_ip)
+                            elif new_ip and new_key == old_key:
                                 log.warning(
-                                    "Attempt %s: Assigned IP %s is blocklisted (quota exhausted until %s). Rotating again...",
+                                    "Attempt %s: Rotated within the same quota identity %s (new address %s); upstream counts the whole /64 as one IP. Retrying fresh registration...",
                                     attempt,
+                                    new_key,
                                     new_ip,
+                                )
+                            elif new_ip:
+                                blocked_until = ip_blocklist.blocked_until(new_key)
+                                log.warning(
+                                    "Attempt %s: Assigned quota identity %s is blocklisted (quota exhausted until %s). Rotating again...",
+                                    attempt,
+                                    new_key,
                                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(blocked_until))
                                     if blocked_until
                                     else "unknown",
                                 )
                             else:
-                                log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
+                                log.warning(f"Attempt {attempt}: No rotated IP could be verified. Retrying fresh registration...")
                     except FileNotFoundError:
                         log.error(f"Cloudflare WARP CLI ('{warp_bin}') was not found. Please install Cloudflare WARP and add warp-cli to PATH.")
                         break

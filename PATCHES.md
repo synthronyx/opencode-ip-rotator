@@ -129,6 +129,22 @@ Keep these when updating, otherwise the proxy will fail with
       minute when a new stream lease is acquired, so the leaked lease table
       cannot block rotation after scheduled rotation is disabled.
 
+13. **Quota identity (/64) and a non-IP-scoped exhaustion breaker**
+    The blocklist grew on every rotation without restoring access.
+
+    - OpenCode's `ipRateLimiter` truncates IPv6 to its first four hextets before
+      building the quota key (`x-real-ip`, then `slice(0, 4)`). The fork now
+      blocks and compares that `/64` identity instead of the full address, and
+      a rotation that stays inside the same `/64` is rejected and retried.
+    - When three distinct quota identities all report `FreeUsageLimitError`, the
+      proxy stops rotating and stops extending the blocklist until the reported
+      reset time (`GLOBAL_EXHAUSTION_IDENTITIES`). The limit is then not
+      IP-scoped, so WARP rotation cannot help.
+    - Existing full-IPv6 rows in `blocked_egress_ips` are migrated to `/64`
+      identities at startup.
+    - Unit tests cover the identity truncation, sibling-address blocking, and
+      the migration.
+
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
 OpenCode V2 custom providers need an explicit model list.

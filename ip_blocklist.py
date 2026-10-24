@@ -34,6 +34,24 @@ EXHAUSTION_RETRY_AFTER_SECONDS = int(
 DEFAULT_BLOCK_SECONDS = int(os.environ.get("IP_EXHAUSTION_BLOCK_SECONDS", "86400"))
 
 
+def quota_identity(ip: Optional[str]) -> Optional[str]:
+    """Return the key the upstream actually uses for its free-tier quota.
+
+    OpenCode's ``ipRateLimiter`` truncates an IPv6 client address to its first
+    four hextets (a /64 prefix) before building the Redis counter key; IPv4 is
+    used verbatim.  Blocking a full IPv6 address therefore misses every sibling
+    address in the same /64, and rotating within that /64 cannot restore quota.
+    """
+    if not ip:
+        return None
+    value = ip.strip()
+    if not value:
+        return None
+    if ":" in value:
+        return ":".join(value.split(":")[:4])
+    return value
+
+
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=5)
@@ -56,8 +74,31 @@ def init_db() -> None:
                 )
                 """
             )
+            _migrate_to_quota_identities(conn)
     except Exception as exc:  # never crash a service because of bookkeeping
         log.warning("Unable to initialise the egress blocklist: %s", exc)
+
+
+def _migrate_to_quota_identities(conn: sqlite3.Connection) -> None:
+    """Collapse old full-IPv6 rows into their /64 quota identities."""
+    rows = conn.execute(
+        "SELECT ip, blocked_until, reason, created_at FROM blocked_egress_ips"
+    ).fetchall()
+    for ip, blocked_until_value, reason, created_at in rows:
+        key = quota_identity(ip)
+        if not key or key == ip:
+            continue
+        conn.execute("DELETE FROM blocked_egress_ips WHERE ip = ?", (ip,))
+        conn.execute(
+            """
+            INSERT INTO blocked_egress_ips (ip, blocked_until, reason, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+                blocked_until = MAX(blocked_egress_ips.blocked_until, excluded.blocked_until),
+                reason = excluded.reason
+            """,
+            (key, blocked_until_value, reason, created_at),
+        )
 
 
 def block_ip(
@@ -70,6 +111,9 @@ def block_ip(
     Returns the expiry timestamp, or ``None`` when the IP was invalid or the
     database could not be written.
     """
+    if not ip:
+        return None
+    ip = quota_identity(ip)
     if not ip:
         return None
     expiry = until if until is not None else time.time() + DEFAULT_BLOCK_SECONDS
@@ -98,15 +142,18 @@ def block_ip(
 
 
 def blocked_until(ip: Optional[str], now: Optional[float] = None) -> Optional[float]:
-    """Return the expiry timestamp while ``ip`` is still blocked."""
+    """Return the expiry timestamp while ``ip``'s quota identity is blocked."""
     if not ip:
+        return None
+    key = quota_identity(ip)
+    if not key:
         return None
     current = time.time() if now is None else now
     try:
         with _connect() as conn:
             row = conn.execute(
                 "SELECT blocked_until FROM blocked_egress_ips WHERE ip = ?",
-                (ip,),
+                (key,),
             ).fetchone()
         if row and row[0] > current:
             return float(row[0])
