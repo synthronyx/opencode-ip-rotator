@@ -169,6 +169,25 @@ def get_public_ip(ip_version: Optional[int] = None) -> Optional[str]:
 _upstream_ip_version: Optional[int] = None
 
 
+def _parse_trace_payload(text: str) -> Optional[str]:
+    """Extract the public IP from a Cloudflare trace response.
+
+    Returns ``None`` when the request did not leave through WARP: the trace then
+    reports the host's real address, which must never enter the egress
+    blocklist.
+    """
+    ip: Optional[str] = None
+    warp: Optional[str] = None
+    for line in text.splitlines():
+        if line.startswith("ip="):
+            ip = line[3:].strip() or None
+        elif line.startswith("warp="):
+            warp = line[5:].strip().lower()
+    if warp == "off":
+        return None
+    return ip
+
+
 def get_upstream_egress_ip(timeout: int = 8) -> Optional[str]:
     """Return the public IP **as seen by the upstream host**.
 
@@ -187,11 +206,9 @@ def get_upstream_egress_ip(timeout: int = 8) -> Optional[str]:
             timeout=timeout,
         )
         if response.status_code == 200:
-            for line in response.text.splitlines():
-                if line.startswith("ip="):
-                    ip = line[3:].strip()
-                    if ip:
-                        return ip
+            ip = _parse_trace_payload(response.text)
+            if ip:
+                return ip
     except Exception:
         pass
 
@@ -205,11 +222,9 @@ def get_upstream_egress_ip(timeout: int = 8) -> Optional[str]:
         )
         with urlopen(request, timeout=timeout) as response:
             if response.status == 200:
-                for line in response.read().decode("utf-8", errors="ignore").splitlines():
-                    if line.startswith("ip="):
-                        ip = line[3:].strip()
-                        if ip:
-                            return ip
+                return _parse_trace_payload(
+                    response.read().decode("utf-8", errors="ignore")
+                )
     except Exception:
         pass
     return None
