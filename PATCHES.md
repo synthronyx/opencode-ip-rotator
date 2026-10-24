@@ -125,9 +125,9 @@ Keep these when updating, otherwise the proxy will fail with
       (default 10s) so concurrent sessions cannot trigger a rotation storm.
     - Health-check 429s no longer rotate (the probe is a public page, not the
       model API).
-    - Expired `active_flow_leases` are pruned on startup and periodically, so
-      the leaked lease table cannot block rotation after scheduled rotation is
-      disabled.
+    - Expired `active_flow_leases` are pruned on startup and at most once a
+      minute when a new stream lease is acquired, so the leaked lease table
+      cannot block rotation after scheduled rotation is disabled.
 
 `sync-models.sh` is an extra helper (not upstream) that copies the models
 discovered by the proxy into `~/.config/opencode/opencode.json`, because
